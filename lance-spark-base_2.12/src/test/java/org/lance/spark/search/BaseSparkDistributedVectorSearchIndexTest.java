@@ -1017,6 +1017,156 @@ public abstract class BaseSparkDistributedVectorSearchIndexTest {
     return fullName;
   }
 
+  /**
+   * One search, several queries: every query gets its own k rows and the rows say which query they
+   * belong to. Each query's rows must be what searching that vector on its own returns, ties
+   * included.
+   */
+  @Test
+  void batchSearchFromInlineQueriesReturnsKEachTaggedWithTheQuery() throws Exception {
+    String table = createTable("vec_batch_inline", 2);
+    buildSegmentPerFragment(table, fragmentIds(table));
+
+    String sql =
+        "SELECT query_id, id, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', queries => array('"
+            + literalVector(100.0)
+            + "', '"
+            + literalVector(5.0)
+            + "'), k => 3, nprobes => "
+            + NUM_PARTITIONS
+            + ", index => '"
+            + INDEX_NAME
+            + "') ORDER BY query_id, _distance, id";
+    List<Row> rows = collect(sql, true);
+    assertEquals(6, rows.size(), "two queries times k rows");
+
+    for (int query = 0; query < 2; query++) {
+      List<Integer> idsForQuery = new ArrayList<>();
+      for (Row row : rows) {
+        if (row.getInt(0) == query) {
+          idsForQuery.add(row.getInt(1));
+        }
+      }
+      assertEquals(3, idsForQuery.size(), "every query must get exactly k rows");
+      float center = query == 0 ? 100.0f : 5.0f;
+      String single =
+          "SELECT id FROM VECTOR_SEARCH(table => '"
+              + table
+              + "', query_vector => "
+              + constantVectorSql(center)
+              + ", k => 3, nprobes => "
+              + NUM_PARTITIONS
+              + ", index => '"
+              + INDEX_NAME
+              + "') ORDER BY _distance, id";
+      assertEquals(
+          ids(collect(single, true)),
+          idsForQuery,
+          "query " + query + " in a batch must return what the single search returns");
+    }
+  }
+
+  /** The query vectors come from a table, ordered by its id column rather than by insert order. */
+  @Test
+  void batchSearchReadsItsQueriesFromATableInIdOrder() throws Exception {
+    String table = createTable("vec_batch_table", 2);
+    buildSegmentPerFragment(table, fragmentIds(table));
+
+    String queries = CATALOG_NAME + ".default.batch_queries";
+    spark.sql("DROP TABLE IF EXISTS " + queries + " PURGE");
+    spark.sql(
+        "CREATE TABLE "
+            + queries
+            + " (qid INT NOT NULL, vec ARRAY<FLOAT> NOT NULL) USING lance "
+            + "TBLPROPERTIES ('vec.arrow.fixed-size-list.size' = '"
+            + DIM
+            + "')");
+    // Inserted in reverse id order: the ids carried by the results must come from the ordering.
+    spark.sql("INSERT INTO " + queries + " SELECT 2, " + constantVectorSql(100.0));
+    spark.sql("INSERT INTO " + queries + " SELECT 1, " + constantVectorSql(5.0));
+
+    String sql =
+        "SELECT query_id, id FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_table => '"
+            + queries
+            + "', query_id_column => 'qid', query_vector_column => 'vec', k => 3, nprobes => "
+            + NUM_PARTITIONS
+            + ", index => '"
+            + INDEX_NAME
+            + "') ORDER BY query_id, _distance, id";
+    List<Row> rows = collect(sql, true);
+    assertEquals(6, rows.size(), "two queries times k rows");
+    assertEquals(5, rows.get(0).getInt(1), "the smallest qid is query 0 and finds its nearest row");
+    assertEquals(100, rows.get(3).getInt(1), "the next qid is query 1 and finds its nearest row");
+  }
+
+  /** Two query sources at once is a mistake, not something to pick from. */
+  @Test
+  void batchSearchRejectsTwoQuerySources() {
+    String table = createTable("vec_batch_both", 1);
+    Exception error =
+        assertThrows(
+            Exception.class,
+            () ->
+                collect(
+                    "SELECT id FROM VECTOR_SEARCH(table => '"
+                        + table
+                        + "', query_vector => "
+                        + queryVectorSql()
+                        + ", queries => array('"
+                        + literalVector(5.0)
+                        + "'), k => 3)",
+                    true));
+    assertTrue(
+        rootMessage(error).contains("either"),
+        "error must say only one query source is allowed, got: " + rootMessage(error));
+  }
+
+  /**
+   * The namespace queryTable response carries no query attribution, so a batch needs Spark tasks.
+   */
+  @Test
+  void batchSearchRequiresDistributedExecution() {
+    String table = createTable("vec_batch_single", 1);
+    Exception error =
+        assertThrows(
+            Exception.class,
+            () ->
+                collect(
+                    "SELECT id FROM VECTOR_SEARCH(table => '"
+                        + table
+                        + "', queries => array('"
+                        + literalVector(5.0)
+                        + "'), k => 3)",
+                    false));
+    assertTrue(
+        rootMessage(error).contains("distributed"),
+        "error must point at distributed execution, got: " + rootMessage(error));
+  }
+
+  /** A vector whose every dimension is {@code value}, so distance ranks by |id - value|. */
+  private String constantVectorSql(double value) {
+    List<String> values = new ArrayList<>();
+    for (int i = 0; i < DIM; i++) {
+      values.add(Double.toString(value));
+    }
+    return "array(" + String.join(", ", values) + ")";
+  }
+
+  /**
+   * The same vector as one comma-separated literal, the shape the inline `queries` argument takes.
+   */
+  private String literalVector(double value) {
+    List<String> values = new ArrayList<>();
+    for (int i = 0; i < DIM; i++) {
+      values.add(Double.toString(value));
+    }
+    return String.join(",", values);
+  }
+
   /** Unit vector along the first axis: scores direction for cosine indexes. */
   private String headingVectorSql() {
     List<String> values = new ArrayList<>();

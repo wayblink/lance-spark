@@ -204,11 +204,14 @@ public class LanceDistributedSearchColumnarPartitionReader
 
     boolean fallbackUnit = p.getIndexSegments().isEmpty();
 
-    Query.Builder q =
-        new Query.Builder()
-            .setColumn(column)
-            .setKey(toFloatArray(base.getVector()))
-            .setK(base.getK());
+    Query.Builder q = new Query.Builder().setColumn(column).setK(base.getK());
+    if (base.isBatch()) {
+      // One scan answers the whole batch: the native layer walks the queries inside it, so the
+      // index is opened once per task instead of once per query.
+      q.setKeys(toFloatMatrix(base.getVectors(), base.getQueryCount(), base.getVectorDim()));
+    } else {
+      q.setKey(toFloatArray(base.getVector()));
+    }
     // lance-core defaults use_index to true, and a fragment-restricted scan still picks up an
     // index segment covering the fragment, so a flat unit has to opt out to stay exact.
     if (fallbackUnit) {
@@ -280,6 +283,18 @@ public class LanceDistributedSearchColumnarPartitionReader
       default:
         throw new IllegalArgumentException("Unsupported distance_type: " + name);
     }
+  }
+
+  /** Rebuilds the {@code queries x dimension} matrix lance-core takes for a batch search. */
+  private static float[][] toFloatMatrix(List<Float> flat, int queries, int dimension) {
+    float[][] matrix = new float[queries][dimension];
+    for (int row = 0; row < queries; row++) {
+      int base = row * dimension;
+      for (int column = 0; column < dimension; column++) {
+        matrix[row][column] = flat.get(base + column);
+      }
+    }
+    return matrix;
   }
 
   private static float[] toFloatArray(List<Float> vec) {

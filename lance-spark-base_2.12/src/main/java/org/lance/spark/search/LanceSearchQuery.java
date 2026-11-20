@@ -51,6 +51,19 @@ public class LanceSearchQuery implements Serializable {
   private final String filter;
   private final Boolean withRowId;
   private final List<Float> vector;
+
+  /**
+   * Batch of query vectors, {@code queries * dimension} floats in row-major order. Empty for a
+   * single-vector search, whose {@link #vector} field then carries that vector unchanged.
+   */
+  private final List<Float> vectors;
+
+  /** Number of query vectors in a batch; 0 for a single-vector search. */
+  private final int queryCount;
+
+  /** Dimension of each query vector in a batch; 0 for a single-vector search. */
+  private final int vectorDim;
+
   private final String vectorColumn;
   private final String indexName;
   private final String distanceType;
@@ -80,6 +93,9 @@ public class LanceSearchQuery implements Serializable {
     this.filter = builder.filter;
     this.withRowId = builder.withRowId;
     this.vector = immutableList(builder.vector);
+    this.vectors = immutableList(builder.vectors);
+    this.queryCount = builder.queryCount;
+    this.vectorDim = builder.vectorDim;
     this.vectorColumn = builder.vectorColumn;
     this.indexName = builder.indexName;
     this.distanceType = builder.distanceType;
@@ -242,6 +258,26 @@ public class LanceSearchQuery implements Serializable {
     return fullTextQueryJson;
   }
 
+  /** Flattened batch of query vectors; empty when this is a single-vector search. */
+  public List<Float> getVectors() {
+    return vectors;
+  }
+
+  /** Number of query vectors in a batch, or 0 for a single-vector search. */
+  public int getQueryCount() {
+    return queryCount;
+  }
+
+  /** Dimension of each query vector in a batch, or 0 for a single-vector search. */
+  public int getVectorDim() {
+    return vectorDim;
+  }
+
+  /** True when this search carries more than one query vector. */
+  public boolean isBatch() {
+    return queryCount > 0;
+  }
+
   public QueryTableRequest toQueryTableRequest() {
     QueryTableRequest request = new QueryTableRequest().id(tableId).k(k);
     request.vector(new QueryTableRequestVector());
@@ -266,6 +302,12 @@ public class LanceSearchQuery implements Serializable {
     }
 
     if (searchType == SearchType.VECTOR) {
+      if (isBatch()) {
+        throw new IllegalArgumentException(
+            "A batch search is not supported through the namespace queryTable API: its response "
+                + "carries no per-query attribution. Enable "
+                + "spark.sql.lance.search.distributed.enabled to run it as Spark tasks.");
+      }
       request.vector(new QueryTableRequestVector().singleVector(vector));
       if (vectorColumn != null) {
         request.vectorColumn(vectorColumn);
@@ -340,6 +382,9 @@ public class LanceSearchQuery implements Serializable {
     private String filter;
     private Boolean withRowId;
     private List<Float> vector = Collections.emptyList();
+    private List<Float> vectors = Collections.emptyList();
+    private int queryCount;
+    private int vectorDim;
     private String vectorColumn;
     private String indexName;
     private String distanceType;
@@ -373,6 +418,9 @@ public class LanceSearchQuery implements Serializable {
       this.filter = query.filter;
       this.withRowId = query.withRowId;
       this.vector = query.vector;
+      this.vectors = query.vectors;
+      this.queryCount = query.queryCount;
+      this.vectorDim = query.vectorDim;
       this.vectorColumn = query.vectorColumn;
       this.indexName = query.indexName;
       this.distanceType = query.distanceType;
@@ -447,6 +495,39 @@ public class LanceSearchQuery implements Serializable {
 
     public Builder vector(List<Float> vector) {
       this.vector = vector;
+      return this;
+    }
+
+    /**
+     * A batch of query vectors, all of the same dimension, given as {@code queries} rows of {@code
+     * dimension} floats each. The batch is stored flattened, which is the layout lance-core takes
+     * and the one a task has to rebuild only once.
+     */
+    public Builder vectors(List<List<Float>> queries) {
+      if (queries == null || queries.isEmpty()) {
+        this.vectors = new ArrayList<>();
+        this.queryCount = 0;
+        this.vectorDim = 0;
+        return this;
+      }
+      int dimension = queries.get(0).size();
+      List<Float> flat = new ArrayList<>(queries.size() * dimension);
+      for (int row = 0; row < queries.size(); row++) {
+        List<Float> query = queries.get(row);
+        if (query.size() != dimension) {
+          throw new IllegalArgumentException(
+              "Every query vector must have dimension "
+                  + dimension
+                  + ", but query "
+                  + row
+                  + " has "
+                  + query.size());
+        }
+        flat.addAll(query);
+      }
+      this.vectors = flat;
+      this.queryCount = queries.size();
+      this.vectorDim = dimension;
       return this;
     }
 
@@ -542,8 +623,25 @@ public class LanceSearchQuery implements Serializable {
         throw new IllegalArgumentException(
             "bypass_vector_index and fast_search cannot both be true");
       }
-      if (searchType == SearchType.VECTOR && (vector == null || vector.isEmpty())) {
-        throw new IllegalArgumentException("query_vector is required");
+      if (searchType == SearchType.VECTOR) {
+        boolean single = vector != null && !vector.isEmpty();
+        boolean batch = queryCount > 0;
+        if (single && batch) {
+          throw new IllegalArgumentException(
+              "Specify either query_vector or a batch of queries, not both");
+        }
+        if (!single && !batch) {
+          throw new IllegalArgumentException("query_vector is required");
+        }
+        if (batch && (vectors.size() != (long) queryCount * vectorDim)) {
+          throw new IllegalArgumentException(
+              "A batch search needs queries * dimension vectors, got "
+                  + vectors.size()
+                  + " for "
+                  + queryCount
+                  + " queries of dimension "
+                  + vectorDim);
+        }
       }
       if (searchType == SearchType.FULL_TEXT
           && (textQuery == null || textQuery.isEmpty())

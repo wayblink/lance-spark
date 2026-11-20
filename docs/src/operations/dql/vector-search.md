@@ -47,13 +47,17 @@ Use positional arguments for simple calls and Spark 3.4 compatibility.
 | Argument | Type | Required | Description |
 |----------|------|----------|-------------|
 | `table` | String | Yes | Catalog table name to search. |
-| `query_vector` | Array numeric literal | Yes | Query vector. |
+| `query_vector` | Array numeric literal | One of three | Query vector for a single-query search. |
+| `queries` | Array string literal | One of three | Batch search: one comma-separated vector per element, for example `array('0.1,0.2', '0.3,0.4')`. |
+| `query_table` | String | One of three | Batch search: a table holding one query vector per row. |
+| `query_id_column` | String | No | Column of `query_table` to order the queries by, so `query_id` in the result is stable across runs. |
+| `query_vector_column` | String | No | Vector column of `query_table`. Defaults to `vector`. |
 | `vector_column` | String | No | Vector column name, or a path such as `payload.vec` for a nested column. Lance defaults to `vector` when omitted. |
 | `num_results`, `limit`, or `k` | Integer | No | Number of results. Defaults to `10`. |
 | `distance_type` | String | No | Distance metric: `l2` (`euclidean`), `cosine`, `dot` (`ip`, `inner_product`), or `hamming`. Aliases are normalized to the canonical name. |
 | `columns` | Array string literal | No | Output table columns. `_distance` is always included. Use `array('*')` or omit this argument for all table columns. |
 | `filter` | String | No | SQL filter expression evaluated by Lance. |
-| `offset` | Integer | No | Number of results to skip. Lance Spark requests `num_results + offset` rows from Lance before applying the offset. |
+| `offset` | Integer | No | Number of results to skip. Lance Spark requests `num_results + offset` rows from Lance before applying the offset. Not supported with a batch search. |
 | `version` | Long | No | Lance table version to search. |
 | `nprobes`, `ef` | Integer | No | Vector index search tuning parameters. Raise `nprobes` to probe more IVF partitions, which is what recovers recall lost to an approximate search. |
 | `index` | String | No | Name of the vector index to search. Distributed execution only; without it the first index on the column in manifest order is used. |
@@ -64,6 +68,50 @@ Use positional arguments for simple calls and Spark 3.4 compatibility.
 ## Output
 
 The result includes the requested table columns and a nullable `_distance` float column. If `with_row_id => true`, or if `_rowid` is listed in `columns`, the result also includes Lance row ids.
+
+A batch search returns `k` rows per query and puts a non-null `query_id` integer first. The id is
+the query's position in the batch, zero-based: with `query_table` and `query_id_column` it follows
+that column's order, otherwise the order the queries were given in.
+
+## Batch search
+
+One search can answer many queries. Name them inline, or point at a table that holds one vector per
+row:
+
+=== "Inline queries"
+    ```sql
+    SELECT query_id, id, _distance
+    FROM VECTOR_SEARCH(
+        table => 'lance.default.items',
+        queries => array('0.12,0.34,0.56,0.78', '0.9,0.1,0.0,0.0'),
+        vector_column => 'embedding',
+        num_results => 10
+    )
+    ORDER BY query_id, _distance;
+    ```
+
+=== "Query table"
+    ```sql
+    SELECT query_id, id, _distance
+    FROM VECTOR_SEARCH(
+        table => 'lance.default.items',
+        query_table => 'lance.default.item_queries',
+        query_id_column => 'query_id',
+        query_vector_column => 'embedding',
+        vector_column => 'embedding',
+        num_results => 10
+    )
+    ORDER BY query_id, _distance;
+    ```
+
+Why it is faster than a loop: each task opens its index segment once and answers every query in
+that same scan, instead of paying the open-and-load cost per query. `num_results` is per query, so
+`n` queries return at most `n * num_results` rows; the merge ranks rows inside their query, so one
+query's results cannot crowd out another's.
+
+A batch search requires `spark.sql.lance.search.distributed.enabled=true`: the namespace
+`queryTable` response carries no per-query attribution, so the namespace path rejects a batch rather
+than return rows that cannot be assigned to a query. `offset` and a batch are mutually exclusive.
 
 ## Choosing an index
 
@@ -103,7 +151,8 @@ By default, Spark plans `VECTOR_SEARCH` with one input partition and calls the L
 dataset from its executors, searches vector-index segments and uncovered fragments in parallel,
 and globally merges their candidates. The merge sorts by the distance each task reported, so each
 task returns only its own top `num_results + offset` rows: a row outside a task's local top k
-cannot enter the global top k. `nprobes` and `refine_factor` apply per task.
+cannot enter the global top k. `nprobes` and `refine_factor` apply per task. A batch search ranks
+inside each query before the top-k cut, so every query keeps its own `num_results` rows.
 
 Distributed execution treats `nprobes` as an exact probe count. A namespace server can instead
 forward it as a lower bound and let the search probe further, in which case the two paths reach

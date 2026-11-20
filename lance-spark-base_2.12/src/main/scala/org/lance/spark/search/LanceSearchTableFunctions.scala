@@ -16,8 +16,8 @@ package org.lance.spark.search
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedStar}
-import org.apache.spark.sql.catalyst.expressions.{Ascending, CreateArray, Descending, Expression, Literal, NamedExpression, SortOrder}
-import org.apache.spark.sql.catalyst.plans.logical.{Filter, GlobalLimit, Limit, LocalLimit, LogicalPlan, Offset, Project, Sort}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, CreateArray, CurrentRow, Descending, Expression, LessThanOrEqual, Literal, NamedExpression, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.plans.logical.{Filter, GlobalLimit, Limit, LocalLimit, LogicalPlan, Offset, Project, Sort, Window}
 import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.{DataTypes, StructField, StructType}
@@ -44,13 +44,41 @@ object LanceSearchTableFunctions {
   private val FtsScoreColumn = "_score"
   private val HybridScoreColumn = "_relevance_score"
   private val RowIdColumn = "_rowid"
+  private val QueryIdColumn = "query_id"
+
+  /** The column lance-core appends to a batch result, naming the query each row belongs to. */
+  private val QueryIndexColumn = "query_index"
+  private val BatchRankColumn = "_batch_rank"
   private val NamedArgumentExpressionClass =
     "org.apache.spark.sql.catalyst.expressions.NamedArgumentExpression"
 
   def vectorSearch(args: Seq[Expression]): LogicalPlan = {
     val parsed = parseArgs("VECTOR_SEARCH", args, Seq(TableArg, QueryVectorArg, "k"))
     val tableName = requiredString(parsed, TableArg)
-    val queryVector = requiredFloatArray(parsed, QueryVectorArg)
+    // Three ways to say what to search for; resolved here so the rest of the function only sees
+    // either one vector or a batch.
+    val queryVector = optionalFloatArray(parsed, QueryVectorArg)
+    val inlineQueries = optionalStringArray(parsed, "queries").map(parseInlineQueries)
+    val queryTableName = optionalString(parsed, "query_table")
+    val providedSources =
+      Seq(queryVector.isDefined, inlineQueries.isDefined, queryTableName.isDefined).count(identity)
+    if (providedSources > 1) {
+      throw new IllegalArgumentException(
+        s"VECTOR_SEARCH accepts either query_vector, queries or query_table, not several at once")
+    }
+    if (providedSources == 0) {
+      throw new IllegalArgumentException("query_vector is required")
+    }
+    val batchQueries: Option[Seq[Seq[java.lang.Float]]] =
+      inlineQueries.orElse(
+        queryTableName.map(name =>
+          readQueryTable(
+            name,
+            optionalString(parsed, "query_vector_column").getOrElse("vector"),
+            optionalString(parsed, "query_id_column"))))
+    val isBatch = batchQueries.isDefined
+    val batchSize = batchQueries.map(_.size).getOrElse(0)
+    val dimension = batchQueries.map(_.headOption.map(_.size).getOrElse(0)).getOrElse(0)
     val k = optionalInt(parsed, "num_results")
       .orElse(optionalInt(parsed, "limit"))
       .orElse(optionalInt(parsed, "k"))
@@ -59,6 +87,10 @@ object LanceSearchTableFunctions {
     val filter = optionalString(parsed, "filter").orNull
     val withRowId = effectiveWithRowId(parsed, outputColumns)
     val offset = optionalInt(parsed, "offset")
+    if (isBatch && offset.isDefined) {
+      throw new IllegalArgumentException(
+        "offset is not supported with a batch search: every query has its own k rows")
+    }
     val version = optionalLong(parsed, "version")
     val requestK = offset
       .map(value => Integer.valueOf(Math.addExact(k.intValue(), value.intValue())))
@@ -67,8 +99,30 @@ object LanceSearchTableFunctions {
     val schemaColumns =
       requestOutputColumns(resolved.table.schema(), outputColumns, DistanceMetricColumn)
     val requestColumns = namespaceOutputColumns(schemaColumns)
-    val schema =
+    val baseSchema =
       outputSchema(resolved.table.schema(), schemaColumns, DistanceMetricColumn, withRowId)
+    val schema =
+      if (isBatch) {
+        StructType(
+          StructField(QueryIdColumn, DataTypes.IntegerType, nullable = false) +: baseSchema.fields)
+      } else {
+        baseSchema
+      }
+
+    // The builder takes the Java nested list lance-core expects; built here so the element type is
+    // the boxed one its signature names.
+    val batchRows: java.util.List[java.util.List[java.lang.Float]] =
+      batchQueries
+        .map { queries =>
+          val rows = new java.util.ArrayList[java.util.List[java.lang.Float]](queries.size)
+          queries.foreach { query =>
+            val row = new java.util.ArrayList[java.lang.Float](query.size)
+            query.foreach(value => row.add(value))
+            rows.add(row)
+          }
+          rows
+        }
+        .orNull
 
     val builder = LanceSearchQuery
       .builder(SearchType.VECTOR)
@@ -79,7 +133,8 @@ object LanceSearchTableFunctions {
       .readOptions(resolved.table.readOptions())
       .initialStorageOptions(resolved.table.getInitialStorageOptions)
       .outputColumns(requestColumns.asJava)
-      .vector(queryVector.asJava)
+      .vector(queryVector.getOrElse(Seq.empty[java.lang.Float]).asJava)
+      .vectors(batchRows)
       .topK(requestK)
       .vectorColumn(optionalString(parsed, "vector_column").orNull)
       .indexName(
@@ -275,6 +330,13 @@ object LanceSearchTableFunctions {
     if (shouldUseDistributed(query)) {
       distributedRelation(functionName, schema, query, resolved)
     } else {
+      if (query.isBatch) {
+        throw new IllegalArgumentException(
+          s"$functionName with a batch of queries requires distributed search: the namespace " +
+            "queryTable response carries no query attribution, so every row would be missing its " +
+            "query_id. Set spark.sql.lance.search.distributed.enabled=true to run it as Spark " +
+            "tasks.")
+      }
       val requestedIndex = query.getIndexName
       if (requestedIndex != null && !requestedIndex.isEmpty) {
         // The namespace queryTable request has no index field, so the server would pick the index
@@ -316,13 +378,31 @@ object LanceSearchTableFunctions {
     // offset boundaries in task arrival order and paging stops being repeatable. So read the row
     // id even when the query did not ask for it, and project it away afterwards.
     val wantsRowId = java.lang.Boolean.TRUE == query.getWithRowId
+    // A batch carries its query allocation through the native `query_index` column; `query_id` is
+    // produced on top of the scan, so it must not be part of the scan's own schema.
+    val relationSchema =
+      if (query.isBatch) StructType(schema.fields.filterNot(_.name == QueryIdColumn))
+      else schema
     val scanSchema =
-      if (wantsRowId) schema
-      else schema.add(StructField(RowIdColumn, DataTypes.LongType, nullable = true))
+      if (wantsRowId) relationSchema
+      else relationSchema.add(StructField(RowIdColumn, DataTypes.LongType, nullable = true))
     val scanQuery = if (wantsRowId) query else query.toBuilder.withRowId(true).build()
 
+    val batchSchema =
+      if (scanQuery.isBatch) {
+        // lance-core appends the query each row belongs to; the reader needs the column in the
+        // schema for it to survive into the Spark batch.
+        StructType(
+          StructField(
+            QueryIndexColumn,
+            DataTypes.IntegerType,
+            nullable = false) +: scanSchema.fields)
+      } else {
+        scanSchema
+      }
+
     val rel = DataSourceV2Relation.create(
-      new LanceDistributedSearchTable(functionName, scanSchema, scanQuery),
+      new LanceDistributedSearchTable(functionName, batchSchema, scanQuery),
       Some(resolved.catalog),
       Some(resolved.identifier),
       CaseInsensitiveStringMap.empty())
@@ -334,6 +414,12 @@ object LanceSearchTableFunctions {
           throw new IllegalStateException(
             s"Internal column ${name} is missing from vector_search plan.")
         }
+
+    if (scanQuery.isBatch) {
+      // A batch cannot reuse the sort-and-limit below: that keeps the global k, and the rows a
+      // query needs can be any distance, so ranking has to happen inside each query first.
+      return batchRelation(rel, internalColumn, scanQuery.getK, schema, wantsRowId)
+    }
 
     val sortOrder =
       Seq(
@@ -357,6 +443,94 @@ object LanceSearchTableFunctions {
 
     if (wantsRowId) limited
     else Project(rel.output.filterNot(attr => attr.name == RowIdColumn), limited)
+  }
+
+  /**
+   * The global top-k of every query: each task returns its own top k per query, and the merge has
+   * to keep k per query rather than k overall, so the rows are ranked inside their query. Row id
+   * breaks ties the way lance-core does (by `_distance`, then row id), and the query index comes
+   * out as the leading `query_id` column.
+   */
+  private def batchRelation(
+      rel: LogicalPlan,
+      internalColumn: String => org.apache.spark.sql.catalyst.expressions.Attribute,
+      k: Integer,
+      schema: StructType,
+      wantsRowId: Boolean): LogicalPlan = {
+    val partitionSpec = Seq(internalColumn(QueryIndexColumn))
+    val orderSpec =
+      Seq(
+        SortOrder(internalColumn(DistanceMetricColumn), Ascending),
+        SortOrder(internalColumn(RowIdColumn), Ascending))
+    // A bare RowNumber inside Window is rejected by the analyzer; the window function has to carry
+    // its OVER clause the way the parser builds it.
+    val ranking =
+      Window(
+        Seq(
+          Alias(
+            WindowExpression(
+              RowNumber(),
+              WindowSpecDefinition(
+                partitionSpec,
+                orderSpec,
+                SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow))),
+            BatchRankColumn)()),
+        partitionSpec,
+        orderSpec,
+        rel)
+
+    def rankedColumn(name: String) =
+      ranking.output
+        .find(attr => attr.name == name)
+        .getOrElse {
+          throw new IllegalStateException(s"Column ${name} is missing from the ranking plan.")
+        }
+
+    val withinK = Filter(LessThanOrEqual(rankedColumn(BatchRankColumn), Literal(k)), ranking)
+
+    val projected = schema.fields.map { field =>
+      val source =
+        if (field.name == QueryIdColumn) internalColumn(QueryIndexColumn)
+        else internalColumn(field.name)
+      Alias(source, field.name)(): NamedExpression
+    }.toSeq
+    Project(projected, withinK)
+  }
+
+  /**
+   * The global top-k of every query: each unit returns its own top k per query, and the merge has
+   * to keep k per query rather than k overall, so the rows are ranked inside their query first.
+   * Row id breaks ties the way lance-core does (by `_distance`, then row id), and the query index
+   * becomes the leading `query_id` column the caller sees.
+   */
+  private def batchRelation(
+      rel: LogicalPlan,
+      limited: LogicalPlan,
+      schema: StructType,
+      wantsRowId: Boolean): LogicalPlan = {
+    def internalColumn(name: String) =
+      rel.output
+        .find(attr => attr.name == name)
+        .getOrElse {
+          throw new IllegalStateException(
+            s"Internal column ${name} is missing from a batch vector_search plan.")
+        }
+
+    val ranking =
+      Window(
+        Seq(Alias(RowNumber(), BatchRankColumn)()),
+        Seq(internalColumn(QueryIndexColumn)),
+        Seq(
+          SortOrder(internalColumn(DistanceMetricColumn), Ascending),
+          SortOrder(internalColumn(RowIdColumn), Ascending)),
+        limited)
+
+    val withinK = Filter(
+      LessThanOrEqual(
+        internalColumn(BatchRankColumn),
+        Literal(schema.fields.headOption.map(_ => 0).getOrElse(0))),
+      ranking)
+    withinK
   }
 
   private def shouldUseDistributed(query: LanceSearchQuery): Boolean = {
@@ -400,6 +574,80 @@ object LanceSearchTableFunctions {
       Some(resolved.catalog),
       Some(resolved.identifier),
       CaseInsensitiveStringMap.empty())
+  }
+
+  /** Parses the inline `queries => array('0.1,0.2', ...)` form, one comma-separated list each. */
+  private def parseInlineQueries(encoded: Seq[String]): Seq[Seq[java.lang.Float]] = {
+    if (encoded.isEmpty) {
+      throw new IllegalArgumentException("queries must name at least one query vector")
+    }
+    val parsed = encoded.map { one =>
+      val values = one.split(",").map(_.trim)
+      if (values.exists(_.isEmpty)) {
+        throw new IllegalArgumentException(
+          s"Every query in queries must be a comma-separated list of numbers, got: '$one'")
+      }
+      values.map { value =>
+        try {
+          java.lang.Float.valueOf(value)
+        } catch {
+          case _: NumberFormatException =>
+            throw new IllegalArgumentException(
+              s"'$value' in queries is not a number (query: '$one')")
+        }
+      }.toSeq
+    }
+    val dimension = parsed.head.size
+    parsed.zipWithIndex.foreach { case (query, index) =>
+      if (query.size != dimension) {
+        throw new IllegalArgumentException(
+          s"Every query vector must have dimension $dimension, but query $index has ${query.size}")
+      }
+    }
+    parsed
+  }
+
+  /**
+   * Reads one query vector per row of a table, ordered by its id column when one is given so the
+   * `query_id` a result carries means the same thing on every run.
+   */
+  private def readQueryTable(
+      name: String,
+      vectorColumn: String,
+      idColumn: Option[String]): Seq[Seq[java.lang.Float]] = {
+    val spark = SparkSession.active
+    val qualified = name
+    val sql =
+      s"SELECT `$vectorColumn` FROM $qualified" + idColumn.map(id => s" ORDER BY `$id`").getOrElse(
+        "")
+    val queries = scala.collection.mutable.ArrayBuffer.empty[Seq[java.lang.Float]]
+    val iterator = spark.sql(sql).toLocalIterator()
+    while (iterator.hasNext) {
+      val row = iterator.next()
+      val values = row.getList[Any](0)
+      if (values != null) {
+        val query = new Array[java.lang.Float](values.size())
+        var i = 0
+        while (i < query.length) {
+          query(i) = java.lang.Float.valueOf(values.get(i).asInstanceOf[Number].floatValue())
+          i += 1
+        }
+        queries += query.toSeq
+      }
+    }
+    if (queries.isEmpty) {
+      throw new IllegalArgumentException(
+        s"query_table '$name' holds no vector rows; a batch search needs at least one query")
+    }
+    val dimension = queries.head.size
+    queries.zipWithIndex.foreach { case (query, index) =>
+      if (query.size != dimension) {
+        throw new IllegalArgumentException(
+          s"Every query vector must have dimension $dimension, but row $index of '$name' has " +
+            s"${query.size}")
+      }
+    }
+    queries.toSeq
   }
 
   private def parseArgs(

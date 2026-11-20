@@ -210,7 +210,9 @@ case class RefreshIndexExec(
     if (matched.isEmpty) {
       throw new IllegalArgumentException(
         s"Index '$indexName' does not exist on table ${ident.toString}. " +
-          "Create it with ALTER TABLE ... CREATE INDEX first.")
+          "Create it with ALTER TABLE ... CREATE INDEX first. A name containing '-' must be " +
+          "quoted with backticks (for example REFRESH INDEX `my-index`): without them only the " +
+          "first token reaches the command.")
     }
     if (matched.size > 1) {
       throw new IllegalArgumentException(

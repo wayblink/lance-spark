@@ -388,6 +388,9 @@ The `CREATE INDEX` command operates as follows:
 
 ## Notes and Limitations
 
+- **Index Names**: an index name is an identifier, so quote a name containing `-` with backticks
+  (`` `fmt-np583-4b` ``) in `CREATE INDEX`, `REFRESH INDEX`, `OPTIMIZE INDEX` and `DROP INDEX`.
+  Without the backticks the name is parsed as an expression and only its first token is used.
 - **Index Methods**: The `zonemap`, `bitmap`, `label_list`, `ngram`, `bloomfilter`, `rtree`, `btree`, `fts` (or `inverted`), and `ivf_rq` methods are supported for index creation.
 - **Indexed Column Count**: All supported index methods currently support exactly one indexed column.
 - **Index Replacement**: If you create an index with the same name as an existing one, the old index will be replaced by the new one.

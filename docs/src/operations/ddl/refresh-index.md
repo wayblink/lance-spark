@@ -232,6 +232,20 @@ rebuild is the fix there.
   [CREATE INDEX](./create-index.md) when the count grows. [SHOW INDEXES](./show-indexes.md) reports
   `num_segments`.
 
+## Index names
+
+An index name is an identifier, so a name containing `-` has to be quoted with backticks in every
+command that names it:
+
+```sql
+ALTER TABLE lance.db.items REFRESH INDEX `fmt-np583-4b`;
+```
+
+Without the backticks the name is parsed as an expression and only its first token reaches the
+command: `REFRESH INDEX fmt-np583-4b` looks for an index called `fmt` and fails with
+`Index 'fmt' does not exist`. The same applies to [CREATE INDEX](./create-index.md),
+[OPTIMIZE INDEX](./optimize-index.md) and [DROP INDEX](./drop-index.md).
+
 ## See Also
 
 - [CREATE INDEX](./create-index.md)

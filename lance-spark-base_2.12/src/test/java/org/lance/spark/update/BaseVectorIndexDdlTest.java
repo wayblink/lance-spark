@@ -403,6 +403,27 @@ public abstract class BaseVectorIndexDdlTest {
   }
 
   @Test
+  void refreshRequiresBackticksForAHyphenatedIndexName() throws Exception {
+    String table = createVectorTable("vec_refresh_hyphen", 8, 2);
+    spark.sql(
+        "ALTER TABLE "
+            + table
+            + " CREATE INDEX `vec-idx` USING ivf_rq (vector) WITH (num_bits = 8, num_segments = 1)");
+    appendFragments(table, 8, 100, 1);
+
+    List<Row> refreshed =
+        spark.sql("ALTER TABLE " + table + " REFRESH INDEX `vec-idx`").collectAsList();
+    assertEquals(1L, refreshed.get(0).getLong(0), "the quoted name reaches the whole index");
+
+    Exception error =
+        assertThrows(
+            Exception.class, () -> spark.sql("ALTER TABLE " + table + " REFRESH INDEX vec-idx"));
+    assertTrue(
+        rootMessage(error).contains("backticks"),
+        "an unquoted hyphenated name must point at the quoting rule, got: " + rootMessage(error));
+  }
+
+  @Test
   void refreshAcceptsParametersThatMatchTheRecordedBuild() throws Exception {
     String table = createVectorTable("vec_refresh_match", 8, 4);
     spark.sql(

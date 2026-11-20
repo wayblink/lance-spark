@@ -93,7 +93,11 @@ case class LanceOptimizeIndexExec(
     val criteria = new IndexCriteria.Builder().hasName(indexName).build()
     val description = dataset.describeIndices(criteria).asScala
       .find(_.getName == indexName)
-      .getOrElse(throw new IllegalArgumentException(s"Index '$indexName' does not exist"))
+      .getOrElse(
+        throw new IllegalArgumentException(
+          s"Index '$indexName' does not exist. A name containing '-' must be quoted with " +
+            "backticks (for example OPTIMIZE INDEX `my-index`): without them only the first " +
+            "token reaches the command."))
     IndexState(description.getSegments.size().toLong)
   }
 

@@ -44,6 +44,7 @@ class LanceSearchQueryTest {
             .withRowId(true)
             .vector(Arrays.asList(1.0f, 2.0f))
             .vectorColumn("vector")
+            .indexName("item_vec")
             .distanceType("cosine")
             .nprobes(7)
             .ef(31)
@@ -76,6 +77,7 @@ class LanceSearchQueryTest {
     assertEquals(original.getWithRowId(), copy.getWithRowId());
     assertEquals(original.getVector(), copy.getVector());
     assertEquals(original.getVectorColumn(), copy.getVectorColumn());
+    assertEquals(original.getIndexName(), copy.getIndexName());
     assertEquals(original.getDistanceType(), copy.getDistanceType());
     assertEquals(original.getNprobes(), copy.getNprobes());
     assertEquals(original.getEf(), copy.getEf());

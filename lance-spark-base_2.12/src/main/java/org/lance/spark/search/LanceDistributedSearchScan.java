@@ -124,13 +124,37 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
         return new InputPartition[0];
       }
 
-      String column = resolveVectorColumn();
       boolean fastSearch = Boolean.TRUE.equals(query.getFastSearch());
       boolean bypassVectorIndex = Boolean.TRUE.equals(query.getBypassVectorIndex());
+      String requestedIndex = query.getIndexName();
+      if (requestedIndex != null && requestedIndex.isEmpty()) {
+        // An empty name is a mistake, not "no name": treating it as absent would run some other
+        // index while the caller believes they picked one.
+        throw new IllegalArgumentException(
+            "index must name a vector index; an empty name cannot select one");
+      }
+      NamedVectorIndex namedIndex =
+          requestedIndex != null
+              ? resolveNamedVectorIndex(dataset, requestedIndex, query.getVectorColumn())
+              : null;
+      // A named index decides the column, even when the search bypasses the index: the caller
+      // named an index, so the column it was built on is the one they mean.
+      String column = namedIndex != null ? namedIndex.column : resolveVectorColumn();
+      if (namedIndex != null && bypassVectorIndex) {
+        // bypass_vector_index means "do not search an index"; naming one is not a conflict worth
+        // failing on, but it must not look as if the named index was used.
+        LOG.warn("Ignoring index {} because bypass_vector_index=true", requestedIndex);
+      }
       Optional<VectorIndexInfo> vectorIndex =
           bypassVectorIndex
               ? Optional.empty()
-              : selectVectorIndex(dataset, column, query.getDistanceType(), fastSearch);
+              : selectVectorIndex(
+                  dataset,
+                  column,
+                  query.getDistanceType(),
+                  fastSearch,
+                  namedIndex == null ? null : namedIndex.description,
+                  namedIndex == null ? null : namedIndex.allIndices);
 
       // A segment whose fragments are all gone (compaction, deletion) is stale: no unit for it.
       Set<Integer> fallbackFragments = new TreeSet<>(existingFragments);
@@ -229,15 +253,134 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
     return DEFAULT_VECTOR_COLUMN;
   }
 
-  private static Optional<VectorIndexInfo> selectVectorIndex(
-      Dataset dataset, String column, String requestedMetric, boolean fastSearch) {
+  /** A named vector index, the column it indexes, and the listing it was found in. */
+  private static final class NamedVectorIndex {
+    private final IndexDescription description;
+    private final String column;
+    private final List<IndexDescription> allIndices;
+
+    NamedVectorIndex(
+        IndexDescription description, String column, List<IndexDescription> allIndices) {
+      this.description = description;
+      this.column = column;
+      this.allIndices = allIndices;
+    }
+  }
+
+  /**
+   * The index the user named, or a failure that lists what can be named instead.
+   *
+   * <p>Deliberately never falls back: a name that does not resolve is a mistake in the query, and
+   * searching some other index silently is how a benchmark measures the wrong thing.
+   *
+   * <p>The listing is returned to the caller so selection reuses it. Index discovery reads more
+   * than names - on a large table the vector statistics it loads are the expensive part - so
+   * listing twice per query would double a cost that has already been enough to OOM a driver.
+   */
+  private static NamedVectorIndex resolveNamedVectorIndex(
+      Dataset dataset, String requestedIndex, String declaredColumn) {
     List<IndexDescription> indices;
     try {
       indices = dataset.describeIndices(new IndexCriteria.Builder().build());
     } catch (Exception e) {
-      failFastSearchWhenIndexDiscoveryFails(fastSearch, e);
-      LOG.warn("describeIndices failed, falling back to flat search: {}", e.getMessage());
-      return Optional.empty();
+      throw new IllegalStateException(
+          "Cannot resolve vector index '" + requestedIndex + "': index discovery failed", e);
+    }
+
+    IndexDescription named = null;
+    List<String> available = new ArrayList<>();
+    for (IndexDescription idx : indices) {
+      if (!isVectorIndex(idx)) {
+        continue;
+      }
+      available.add(idx.getName());
+      if (idx.getName().equals(requestedIndex)) {
+        named = idx;
+      }
+    }
+    if (named == null) {
+      Collections.sort(available);
+      throw new IllegalArgumentException(
+          "Vector index '"
+              + requestedIndex
+              + "' does not exist"
+              + (available.isEmpty()
+                  ? "; the table has no vector indexes"
+                  : ". Available vector indexes: " + String.join(", ", available)));
+    }
+
+    String indexColumn = columnOfIndex(dataset, named);
+    if (declaredColumn != null
+        && !declaredColumn.isEmpty()
+        && !sameVectorColumn(declaredColumn, indexColumn)) {
+      throw new IllegalArgumentException(
+          "vector_column '"
+              + declaredColumn
+              + "' does not match vector index '"
+              + requestedIndex
+              + "', which is built on '"
+              + indexColumn
+              + "'");
+    }
+    return new NamedVectorIndex(named, indexColumn, indices);
+  }
+
+  /**
+   * Whether the caller's {@code vector_column} names the same field as the canonical path an index
+   * was built on.
+   *
+   * <p>Compared as parsed paths, not as strings: {@link FieldPathUtils#canonicalPath} quotes a part
+   * only when it has to, so a column whose name contains a hyphen has the canonical form {@code
+   * `my-vec`} while a caller may legitimately write {@code my-vec}.
+   */
+  static boolean sameVectorColumn(String declared, String canonical) {
+    try {
+      return FieldPathUtils.parseCanonicalPath(declared)
+          .equals(FieldPathUtils.parseCanonicalPath(canonical));
+    } catch (IllegalArgumentException e) {
+      return false;
+    }
+  }
+
+  /** The column a vector index was built on, as the canonical path the scan needs. */
+  private static String columnOfIndex(Dataset dataset, IndexDescription index) {
+    List<Integer> fieldIds = index.getFieldIds();
+    if (fieldIds == null || fieldIds.isEmpty()) {
+      throw new IllegalArgumentException(
+          "Vector index '" + index.getName() + "' does not record the column it indexes");
+    }
+    String column = FieldPathUtils.pathByFieldId(dataset.getLanceSchema(), fieldIds.get(0));
+    if (column == null || column.isEmpty()) {
+      throw new IllegalArgumentException(
+          "Cannot resolve the column of vector index '"
+              + index.getName()
+              + "': field id "
+              + fieldIds.get(0)
+              + " is not in the dataset schema");
+    }
+    return column;
+  }
+
+  private static Optional<VectorIndexInfo> selectVectorIndex(
+      Dataset dataset,
+      String column,
+      String requestedMetric,
+      boolean fastSearch,
+      IndexDescription namedIndex,
+      List<IndexDescription> knownIndices) {
+    List<IndexDescription> indices;
+    if (knownIndices != null) {
+      // The named path already listed the indexes; asking the dataset again would read the same
+      // statistics twice.
+      indices = knownIndices;
+    } else {
+      try {
+        indices = dataset.describeIndices(new IndexCriteria.Builder().build());
+      } catch (Exception e) {
+        failFastSearchWhenIndexDiscoveryFails(fastSearch, e);
+        LOG.warn("describeIndices failed, falling back to flat search: {}", e.getMessage());
+        return Optional.empty();
+      }
     }
 
     int columnFieldId;
@@ -248,8 +391,12 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
           "Cannot find vector column '" + column + "' in the Lance schema", e);
     }
 
-    // A column can carry several vector indexes, so the choice has to match lance-core's.
-    Optional<IndexDescription> selected = firstIndexOnColumn(dataset, indices, columnFieldId);
+    // A column can carry several vector indexes, so the choice has to match lance-core's - unless
+    // the user named one, in which case the name wins.
+    Optional<IndexDescription> selected =
+        namedIndex != null
+            ? Optional.of(namedIndex)
+            : firstIndexOnColumn(dataset, indices, columnFieldId);
     if (!selected.isPresent()) {
       return Optional.empty();
     }
@@ -258,6 +405,18 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
     String normalizedRequested = normalizeMetric(requestedMetric);
     Optional<String> indexMetric = resolveIndexMetric(dataset, idx);
     if (!indexMetricIsUsable(normalizedRequested, indexMetric)) {
+      if (namedIndex != null) {
+        // Naming an index is a promise about which index the query uses; a metric mismatch is a
+        // query error, not something to paper over by scanning flat.
+        throw new IllegalArgumentException(
+            "Cannot search vector index '"
+                + idx.getName()
+                + "' with distance_type '"
+                + normalizedRequested
+                + "': the index was built with '"
+                + indexMetric.orElse("an unreadable metric")
+                + "'. Omit distance_type to use the index metric, or query a matching index.");
+      }
       if (indexMetric.isPresent()) {
         LOG.warn(
             "Ignoring vector index {} because query metric {} does not match index metric {}",

@@ -82,6 +82,8 @@ object LanceSearchTableFunctions {
       .vector(queryVector.asJava)
       .topK(requestK)
       .vectorColumn(optionalString(parsed, "vector_column").orNull)
+      .indexName(
+        optionalString(parsed, "index").orElse(optionalString(parsed, "index_name")).orNull)
       .distanceType(optionalString(parsed, "distance_type").orNull)
       .filter(filter)
       .offset(offset.orNull)
@@ -269,12 +271,23 @@ object LanceSearchTableFunctions {
       functionName: String,
       schema: StructType,
       query: LanceSearchQuery,
-      resolved: ResolvedLanceTable): LogicalPlan =
+      resolved: ResolvedLanceTable): LogicalPlan = {
     if (shouldUseDistributed(query)) {
       distributedRelation(functionName, schema, query, resolved)
     } else {
+      val requestedIndex = query.getIndexName
+      if (requestedIndex != null && !requestedIndex.isEmpty) {
+        // The namespace queryTable request has no index field, so the server would pick the index
+        // itself. Failing here is the only honest answer: silently ignoring the name is exactly
+        // the "measured the wrong index" failure this option exists to prevent.
+        throw new IllegalArgumentException(
+          s"$functionName index => '$requestedIndex' requires distributed search: the namespace " +
+            "queryTable API cannot choose an index, so the server would pick it. Set " +
+            "spark.sql.lance.search.distributed.enabled=true to search a named index.")
+      }
       searchRelation(functionName, schema, query, resolved)
     }
+  }
 
   /** Search served by the namespace itself: one partition, results already globally ranked. */
   private def searchRelation(

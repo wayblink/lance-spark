@@ -578,42 +578,7 @@ public abstract class BaseSparkDistributedVectorSearchIndexTest {
     // describeIndices sorts by index name, lance-core takes the first index on the column in
     // creation order. With two metrics on one column the two orders select different indexes, and
     // "nearest" then means something different on each path.
-    String table = CATALOG_NAME + ".default.idx_two_metrics";
-    spark.sql(
-        "CREATE TABLE "
-            + table
-            + " (id INT NOT NULL, "
-            + VECTOR_COLUMN
-            + " ARRAY<FLOAT> NOT NULL) USING lance "
-            + "TBLPROPERTIES ('vector.arrow.fixed-size-list.size' = '"
-            + DIM
-            + "')");
-    // Even ids: magnitude 10 at a tiny angle - excellent cosine, poor L2.
-    // Odd ids: magnitude 1 at ~45 degrees - poor cosine, excellent L2.
-    spark.sql(
-        "INSERT INTO "
-            + table
-            + " SELECT CAST(id AS INT), array("
-            + "CAST(CASE WHEN id % 2 = 0 THEN 10 * cos(radians(id * 0.5)) "
-            + "ELSE 1 * cos(radians(45 + id * 0.5)) END AS FLOAT), "
-            + "CAST(CASE WHEN id % 2 = 0 THEN 10 * sin(radians(id * 0.5)) "
-            + "ELSE 1 * sin(radians(45 + id * 0.5)) END AS FLOAT), "
-            + "0.0, 0.0, 0.0, 0.0, 0.0, 0.0) FROM range(0, 128, 1, 1)");
-
-    // vec_l2 first in creation order; a_cos first by name.
-    for (Object[] spec :
-        new Object[][] {{"vec_l2", DistanceType.L2}, {"a_cos", DistanceType.Cosine}}) {
-      try (Dataset ds = openDataset(table)) {
-        ds.createIndex(
-            IndexOptions.builder(
-                    Collections.singletonList(VECTOR_COLUMN),
-                    IndexType.IVF_FLAT,
-                    indexParams(ds, (DistanceType) spec[1]))
-                .withIndexName((String) spec[0])
-                .build());
-      }
-    }
-    spark.sql("REFRESH TABLE " + table);
+    String table = createTwoMetricIndexTable("idx_two_metrics");
     try (Dataset ds = openDataset(table)) {
       assertEquals(
           java.util.Arrays.asList("vec_l2", "a_cos"),
@@ -621,12 +586,7 @@ public abstract class BaseSparkDistributedVectorSearchIndexTest {
           "sanity: creation order must differ from name order for this to test anything");
     }
 
-    String sql =
-        "SELECT id FROM VECTOR_SEARCH(table => '"
-            + table
-            + "', query_vector => array(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), k => 6, nprobes => "
-            + NUM_PARTITIONS
-            + ")";
+    String sql = vectorSearchSql(table, 6, "");
     List<Integer> reference = ids(collect(sql, false));
     List<Integer> distributed = ids(collect(sql, true));
     assertEquals(
@@ -634,6 +594,154 @@ public abstract class BaseSparkDistributedVectorSearchIndexTest {
     for (Integer id : distributed) {
       assertEquals(1, id % 2, "vec_l2 is the L2 index, whose neighbours here are the odd ids");
     }
+  }
+
+  /**
+   * The whole point of {@code index => 'name'}: two indexes on one column can be queried
+   * separately. Without it the selector is manifest order, so only {@code vec_l2} is reachable.
+   */
+  @Test
+  void namedIndexSelectsThatIndexOnOneColumn() throws Exception {
+    String table = createTwoMetricIndexTable("idx_named");
+
+    // A cosine index cannot rank a zero-length query vector, so this query points along 0 degrees:
+    // the even ids sit at tiny angles, the odd ids at ~45.
+    List<Integer> cosine =
+        ids(collect(vectorSearchSql(table, 6, headingVectorSql(), ", index => 'a_cos'"), true));
+    assertEquals(6, cosine.size(), "the query must return k rows");
+    for (Integer id : cosine) {
+      assertEquals(0, id % 2, "a_cos is the cosine index, whose neighbours here are the even ids");
+    }
+
+    List<Integer> l2 = ids(collect(vectorSearchSql(table, 6, ", index => 'vec_l2'"), true));
+    for (Integer id : l2) {
+      assertEquals(1, id % 2, "vec_l2 is the L2 index, whose neighbours here are the odd ids");
+    }
+  }
+
+  @Test
+  void unknownIndexNameFailsWithTheAvailableNames() throws Exception {
+    String table = createTwoMetricIndexTable("idx_named_missing");
+
+    Throwable error =
+        assertThrows(
+            Exception.class,
+            () -> collect(vectorSearchSql(table, 6, ", index => 'missing_idx'"), true));
+    String message = rootMessage(error);
+    assertTrue(message.contains("missing_idx"), "error must name the request: " + message);
+    assertTrue(
+        message.contains("a_cos") && message.contains("vec_l2"),
+        "error must list the indexes that do exist: " + message);
+  }
+
+  @Test
+  void namedIndexWithConflictingDistanceTypeFails() throws Exception {
+    String table = createTwoMetricIndexTable("idx_named_metric");
+
+    Throwable error =
+        assertThrows(
+            Exception.class,
+            () ->
+                collect(
+                    vectorSearchSql(table, 6, ", index => 'a_cos', distance_type => 'l2'"), true));
+    String message = rootMessage(error);
+    assertTrue(message.contains("a_cos"), "error must name the index: " + message);
+    assertTrue(message.contains("cosine"), "error must report the index metric: " + message);
+  }
+
+  /**
+   * The namespace {@code queryTable} request has no index field, so a named index can only be
+   * honoured by the distributed path. Silently ignoring it would be the #3135 failure mode again.
+   */
+  @Test
+  void namedIndexRequiresDistributedExecution() throws Exception {
+    String table = createTwoMetricIndexTable("idx_named_namespace");
+
+    Throwable error =
+        assertThrows(
+            Exception.class, () -> collect(vectorSearchSql(table, 6, ", index => 'a_cos'"), false));
+    String message = rootMessage(error);
+    assertTrue(
+        message.contains("spark.sql.lance.search.distributed.enabled"),
+        "error must say how to make the option usable: " + message);
+  }
+
+  /** bypass_vector_index means "no index"; the named one is ignored rather than contradictory. */
+  @Test
+  void bypassVectorIndexIgnoresTheNamedIndex() throws Exception {
+    String table = createTwoMetricIndexTable("idx_named_bypass");
+
+    List<Integer> named =
+        ids(
+            collect(
+                vectorSearchSql(table, 6, ", index => 'a_cos', bypass_vector_index => true"),
+                true));
+    List<Integer> plain =
+        ids(collect(vectorSearchSql(table, 6, ", bypass_vector_index => true"), true));
+    assertEquals(plain, named, "a bypassed search must not depend on the named index");
+  }
+
+  /** An empty name is a mistake, not "no name": it must not run some other index silently. */
+  @Test
+  void emptyIndexNameFails() throws Exception {
+    String table = createTwoMetricIndexTable("idx_named_empty");
+
+    Throwable error =
+        assertThrows(
+            Exception.class, () -> collect(vectorSearchSql(table, 6, ", index => ''"), true));
+    String message = rootMessage(error);
+    assertTrue(message.contains("index"), "error must name the argument: " + message);
+    assertTrue(message.contains("empty"), "error must say why: " + message);
+  }
+
+  /**
+   * A bypassed search still uses the named index to decide its column: naming an index and asking
+   * for no index is a contradiction, but the column the caller meant is not.
+   */
+  @Test
+  void bypassVectorIndexStillResolvesTheColumnFromTheName() throws Exception {
+    String table = createNestedVectorTable("idx_named_bypass_nested");
+    buildSegmentPerFragment(table, fragmentIds(table), NESTED_VECTOR_COLUMN, DistanceType.L2);
+
+    String sql =
+        "SELECT id, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_vector => "
+            + queryVectorSql()
+            + ", k => 5, nprobes => "
+            + NUM_PARTITIONS
+            + ", index => '"
+            + INDEX_NAME
+            + "', bypass_vector_index => true)";
+    assertEquals(
+        java.util.Arrays.asList(0, 1, 2, 3, 4),
+        ids(collect(sql, true)),
+        "the flat scan must read the column the named index was built on, without vector_column");
+  }
+
+  /**
+   * With only a name, the search column has to come from the index: the nested column is not what
+   * {@code resolveVectorColumn} would have guessed.
+   */
+  @Test
+  void namedIndexResolvesItsOwnColumn() throws Exception {
+    String table = createNestedVectorTable("idx_named_nested");
+    buildSegmentPerFragment(table, fragmentIds(table), NESTED_VECTOR_COLUMN, DistanceType.L2);
+
+    String sql =
+        "SELECT id, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_vector => "
+            + queryVectorSql()
+            + ", k => 5, nprobes => "
+            + NUM_PARTITIONS
+            + ", index => '"
+            + INDEX_NAME
+            + "')";
+    assertEquals(
+        java.util.Arrays.asList(0, 1, 2, 3, 4),
+        ids(collect(sql, true)),
+        "a named index must search the column it was built on");
   }
 
   /**
@@ -677,6 +785,49 @@ public abstract class BaseSparkDistributedVectorSearchIndexTest {
     assertTrue(
         error.getMessage().contains("payload.absent"),
         "the error must name the column that could not be resolved, got: " + error.getMessage());
+  }
+
+  /**
+   * One vector column carrying two IVF_FLAT indexes with different metrics: {@code vec_l2} (created
+   * first, also first by name) and {@code a_cos} (created second, first by name). Even ids have
+   * magnitude 10 at a tiny angle - excellent cosine, poor L2; odd ids have magnitude 1 at ~45
+   * degrees - poor cosine, excellent L2. So which index runs is visible in the result.
+   */
+  private String createTwoMetricIndexTable(String name) throws Exception {
+    String table = CATALOG_NAME + ".default." + name;
+    spark.sql(
+        "CREATE TABLE "
+            + table
+            + " (id INT NOT NULL, "
+            + VECTOR_COLUMN
+            + " ARRAY<FLOAT> NOT NULL) USING lance "
+            + "TBLPROPERTIES ('vector.arrow.fixed-size-list.size' = '"
+            + DIM
+            + "')");
+    spark.sql(
+        "INSERT INTO "
+            + table
+            + " SELECT CAST(id AS INT), array("
+            + "CAST(CASE WHEN id % 2 = 0 THEN 10 * cos(radians(id * 0.5)) "
+            + "ELSE 1 * cos(radians(45 + id * 0.5)) END AS FLOAT), "
+            + "CAST(CASE WHEN id % 2 = 0 THEN 10 * sin(radians(id * 0.5)) "
+            + "ELSE 1 * sin(radians(45 + id * 0.5)) END AS FLOAT), "
+            + "0.0, 0.0, 0.0, 0.0, 0.0, 0.0) FROM range(0, 128, 1, 1)");
+
+    for (Object[] spec :
+        new Object[][] {{"vec_l2", DistanceType.L2}, {"a_cos", DistanceType.Cosine}}) {
+      try (Dataset ds = openDataset(table)) {
+        ds.createIndex(
+            IndexOptions.builder(
+                    Collections.singletonList(VECTOR_COLUMN),
+                    IndexType.IVF_FLAT,
+                    indexParams(ds, (DistanceType) spec[1]))
+                .withIndexName((String) spec[0])
+                .build());
+      }
+    }
+    spark.sql("REFRESH TABLE " + table);
+    return table;
   }
 
   private String createTable(String name, int inserts) {
@@ -835,6 +986,16 @@ public abstract class BaseSparkDistributedVectorSearchIndexTest {
     return fullName;
   }
 
+  /** Unit vector along the first axis: scores direction for cosine indexes. */
+  private String headingVectorSql() {
+    List<String> values = new ArrayList<>();
+    values.add("1.0");
+    for (int i = 1; i < DIM; i++) {
+      values.add("0.0");
+    }
+    return "array(" + String.join(", ", values) + ")";
+  }
+
   /** Query vector sits at the origin, so the top-k by L2 is simply ids 0, 1, 2, ... */
   private String queryVectorSql() {
     List<String> zeros = new ArrayList<>();
@@ -990,17 +1151,22 @@ public abstract class BaseSparkDistributedVectorSearchIndexTest {
     assertEquals(expected, distributed, "distributed path must return the k smallest ids");
   }
 
-  private String vectorSearchSql(String table, int k, String extraNamedArgs) {
+  private String vectorSearchSql(
+      String table, int k, String queryVectorSql, String extraNamedArgs) {
     return "SELECT id, _distance FROM VECTOR_SEARCH(table => '"
         + table
         + "', query_vector => "
-        + queryVectorSql()
+        + queryVectorSql
         + ", k => "
         + k
         + ", nprobes => "
         + NUM_PARTITIONS
         + extraNamedArgs
         + ")";
+  }
+
+  private String vectorSearchSql(String table, int k, String extraNamedArgs) {
+    return vectorSearchSql(table, k, queryVectorSql(), extraNamedArgs);
   }
 
   private List<Row> collect(String sql, boolean distributed) {

@@ -52,6 +52,7 @@ public class LanceSearchQuery implements Serializable {
   private final Boolean withRowId;
   private final List<Float> vector;
   private final String vectorColumn;
+  private final String indexName;
   private final String distanceType;
   private final Integer nprobes;
   private final Integer ef;
@@ -80,6 +81,7 @@ public class LanceSearchQuery implements Serializable {
     this.withRowId = builder.withRowId;
     this.vector = immutableList(builder.vector);
     this.vectorColumn = builder.vectorColumn;
+    this.indexName = builder.indexName;
     this.distanceType = builder.distanceType;
     this.nprobes = builder.nprobes;
     this.ef = builder.ef;
@@ -177,6 +179,15 @@ public class LanceSearchQuery implements Serializable {
 
   public List<Float> getVector() {
     return vector;
+  }
+
+  /**
+   * Name of the vector index a distributed search must use, or {@code null} for the default
+   * selector. Only the distributed path can honour it: the namespace {@code queryTable} request has
+   * no index field.
+   */
+  public String getIndexName() {
+    return indexName;
   }
 
   public String getVectorColumn() {
@@ -330,6 +341,7 @@ public class LanceSearchQuery implements Serializable {
     private Boolean withRowId;
     private List<Float> vector = Collections.emptyList();
     private String vectorColumn;
+    private String indexName;
     private String distanceType;
     private Integer nprobes;
     private Integer ef;
@@ -362,6 +374,7 @@ public class LanceSearchQuery implements Serializable {
       this.withRowId = query.withRowId;
       this.vector = query.vector;
       this.vectorColumn = query.vectorColumn;
+      this.indexName = query.indexName;
       this.distanceType = query.distanceType;
       this.nprobes = query.nprobes;
       this.ef = query.ef;
@@ -439,6 +452,12 @@ public class LanceSearchQuery implements Serializable {
 
     public Builder vectorColumn(String vectorColumn) {
       this.vectorColumn = vectorColumn;
+      return this;
+    }
+
+    /** Names the vector index to search. Only the distributed path can honour it. */
+    public Builder indexName(String indexName) {
+      this.indexName = indexName;
       return this;
     }
 

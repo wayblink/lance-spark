@@ -56,6 +56,7 @@ Use positional arguments for simple calls and Spark 3.4 compatibility.
 | `offset` | Integer | No | Number of results to skip. Lance Spark requests `num_results + offset` rows from Lance before applying the offset. |
 | `version` | Long | No | Lance table version to search. |
 | `nprobes`, `ef` | Integer | No | Vector index search tuning parameters. Raise `nprobes` to probe more IVF partitions, which is what recovers recall lost to an approximate search. |
+| `index` | String | No | Name of the vector index to search. Distributed execution only; without it the first index on the column in manifest order is used. |
 | `refine_factor` | Integer | No | Over-fetch `num_results * refine_factor` candidates from the index, then re-score them against the original vectors and keep the best `num_results`. Improves accuracy for quantized indexes such as IVF_PQ, at the cost of reading the vectors back. |
 | `lower_bound`, `upper_bound` | Float | No | Distance bounds. |
 | `bypass_vector_index`, `fast_search`, `prefilter`, `with_row_id` | Boolean | No | Lance query options. `with_row_id` adds `_rowid` to the output. `bypass_vector_index` and `fast_search` cannot both be true. |
@@ -63,6 +64,23 @@ Use positional arguments for simple calls and Spark 3.4 compatibility.
 ## Output
 
 The result includes the requested table columns and a nullable `_distance` float column. If `with_row_id => true`, or if `_rowid` is listed in `columns`, the result also includes Lance row ids.
+
+## Choosing an index
+
+`VECTOR_SEARCH(..., index => 'item_vec_cosine')` searches the named index. This only works with
+distributed execution: the namespace `queryTable` API has no index field, so with
+`spark.sql.lance.search.distributed.enabled=false` the option fails instead of being ignored.
+
+Without `index`, the connector keeps its previous behaviour: the first index on the vector column in
+manifest (creation) order, which is what lance-core itself searches. A named index also decides the
+search column, so `vector_column` can be omitted; when both are given they must agree, compared as
+field paths so an unquoted `my-vec` matches the quoted canonical form. An empty name is rejected, and
+`bypass_vector_index => true` still uses the named index to resolve the column even though it does
+not search that index.
+
+An unknown name fails and lists the vector indexes the table has. A `distance_type` that contradicts
+the index metric also fails - a named index is never silently replaced by a flat scan, because that
+is how a query ends up measuring an index it did not ask for.
 
 ## Segment-local vector indexes
 

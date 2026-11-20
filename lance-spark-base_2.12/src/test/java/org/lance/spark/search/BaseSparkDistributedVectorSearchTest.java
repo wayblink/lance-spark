@@ -13,6 +13,8 @@
  */
 package org.lance.spark.search;
 
+import org.lance.spark.read.metric.LanceCustomMetrics;
+
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterEach;
@@ -26,6 +28,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -279,6 +282,53 @@ public abstract class BaseSparkDistributedVectorSearchTest {
         combined.size(),
         new java.util.HashSet<>(combined).size(),
         "the two pages must not repeat a row: " + combined);
+  }
+
+  /**
+   * The distributed search tasks must report the same scan counters and timings as the read path.
+   * Without them a benchmark that differs by 20% between runs cannot tell "storage got slower" from
+   * "native search got slower" (card #3089).
+   */
+  @Test
+  void distributedSearchReportsScanMetrics() throws Exception {
+    String fullName = createFiveFragmentTable();
+    LanceTaskMetricsListener listener = new LanceTaskMetricsListener();
+    spark.sparkContext().addSparkListener(listener);
+    try {
+      spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+      spark
+          .sql("SELECT id FROM VECTOR_SEARCH('" + fullName + "', array(0.0, 0.0, 0.0, 0.0), 3)")
+          .collectAsList();
+      spark.sparkContext().listenerBus().waitUntilEmpty(5000);
+    } finally {
+      spark.sparkContext().removeSparkListener(listener);
+    }
+
+    Map<String, Long> metrics = listener.metricValues();
+    assertTrue(metrics.getOrDefault(LanceCustomMetrics.NUM_IOPS, 0L) > 0, "numIops: " + metrics);
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.NUM_REQUESTS, 0L) > 0, "numRequests: " + metrics);
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.NUM_BYTES_READ, 0L) > 0,
+        "numBytesRead: " + metrics);
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.NUM_BATCHES_LOADED, 0L) >= 1,
+        "numBatchesLoaded: " + metrics);
+    // Derived from Lance's free-form scan counter rather than a documented field: this assertion
+    // is what catches an upstream rename that would silently zero it. Lance's fragments_scanned is
+    // not mapped here - it counts physical fragment scans and reports 2 for one fragment.
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.NUM_ROWS_SCANNED, 0L) > 0,
+        "numRowsScanned: " + metrics);
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.DATASET_OPEN_TIME_NS, 0L) > 0,
+        "datasetOpenTimeNs: " + metrics);
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.SCANNER_CREATE_TIME_NS, 0L) > 0,
+        "scannerCreateTimeNs: " + metrics);
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.BATCH_LOAD_TIME_NS, 0L) > 0,
+        "batchLoadTimeNs: " + metrics);
   }
 
   private List<Integer> idsOf(String sql) {

@@ -26,6 +26,7 @@ import org.lance.index.vector.VectorIndexParams;
 import org.lance.index.vector.VectorTrainer;
 import org.lance.spark.LanceDataset;
 import org.lance.spark.LanceRuntime;
+import org.lance.spark.read.metric.LanceCustomMetrics;
 import org.lance.spark.search.LanceSearchQuery.SearchType;
 import org.lance.spark.utils.VectorUtils;
 
@@ -56,6 +57,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -127,6 +129,35 @@ public abstract class BaseSparkDistributedVectorSearchIndexTest {
     }
 
     assertTopKMatchesReference(table, 10);
+  }
+
+  /**
+   * Indexed units must report the index counters, not only the storage ones: a run whose
+   * `numIndexComparisons` is zero searched flat KNN without saying so, and two runs are only
+   * comparable when both actually read an index.
+   */
+  @Test
+  void indexedSearchReportsIndexMetrics() throws Exception {
+    String table = createTable("idx_metrics", 2);
+    buildSegmentPerFragment(table, fragmentIds(table));
+
+    LanceTaskMetricsListener listener = new LanceTaskMetricsListener();
+    spark.sparkContext().addSparkListener(listener);
+    try {
+      collect(vectorSearchSql(table, 3, ""), true);
+      spark.sparkContext().listenerBus().waitUntilEmpty(5000);
+    } finally {
+      spark.sparkContext().removeSparkListener(listener);
+    }
+
+    Map<String, Long> metrics = listener.metricValues();
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.NUM_PARTS_LOADED, 0L) > 0,
+        "numPartsLoaded: " + metrics);
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.NUM_INDEX_COMPARISONS, 0L) > 0,
+        "numIndexComparisons: " + metrics);
+    assertTrue(metrics.getOrDefault(LanceCustomMetrics.NUM_IOPS, 0L) > 0, "numIops: " + metrics);
   }
 
   @Test

@@ -18,11 +18,14 @@ import org.lance.index.DistanceType;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
+import org.lance.ipc.ScanStats;
 import org.lance.spark.LanceConstant;
 import org.lance.spark.internal.ExecutorNamespace;
+import org.lance.spark.read.metric.LanceReadMetricsTracker;
 import org.lance.spark.utils.Utils;
 
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
@@ -30,6 +33,8 @@ import org.apache.spark.sql.vectorized.ColumnarBatch;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 /**
  * Worker-side partition reader for distributed VECTOR_SEARCH. Opens the Lance dataset locally and
@@ -44,13 +49,27 @@ import java.util.List;
  */
 public class LanceDistributedSearchColumnarPartitionReader
     implements PartitionReader<ColumnarBatch> {
+  /**
+   * Lance's free-form scan counter for physical row reads. It is not part of {@link ScanStats}'
+   * fixed fields, it is an internal name rather than a documented API - so it is read only when
+   * present, and an integration test fails if an upstream rename drops it.
+   *
+   * <p>It counts rows read from storage including the fetches that assemble the top-k rows, so it
+   * is a measure of work done, not of rows matched. Lance's {@code fragments_scanned} counter is
+   * deliberately not mapped to {@code numFragmentsScanned}: it counts physical fragment scans and
+   * reports 2 for a task that scans one fragment.
+   */
+  private static final String STAT_ROWS_SCANNED = "rows_scanned";
+
   private final LanceDistributedSearchInputPartition partition;
+  private final LanceReadMetricsTracker metricsTracker = new LanceReadMetricsTracker();
   private ExecutorNamespace executorNamespace;
   private Dataset dataset;
   private LanceScanner scanner;
   private ArrowReader reader;
   private ColumnarBatch currentBatch;
   private boolean finished;
+  private boolean statsCollected;
 
   public LanceDistributedSearchColumnarPartitionReader(
       LanceDistributedSearchInputPartition partition) {
@@ -65,12 +84,20 @@ public class LanceDistributedSearchColumnarPartitionReader
     if (reader == null) {
       openReader();
     }
-    if (reader.loadNextBatch()) {
+    long batchStart = System.nanoTime();
+    boolean hasNext = reader.loadNextBatch();
+    if (hasNext) {
+      metricsTracker.addBatchLoadTimeNs(System.nanoTime() - batchStart);
+      metricsTracker.addNumBatchesLoaded(1);
       currentBatch =
           LanceSearchColumnarPartitionReader.toColumnarBatch(
               reader.getVectorSchemaRoot(), partition.getSchema());
       return true;
     }
+    // Spark samples the reader's metrics before it calls close() (DataSourceRDD's task-completion
+    // listener), so the counters have to be read while the scan still exists and before this
+    // returns false. Collecting them in close() alone leaves every counter at zero.
+    captureScanStats();
     finished = true;
     return false;
   }
@@ -82,6 +109,9 @@ public class LanceDistributedSearchColumnarPartitionReader
 
   @Override
   public void close() throws IOException {
+    // Fallback for a reader closed before its scan ran dry (cancellation, early stop): the
+    // completion listener has already sampled whatever was published by then.
+    captureScanStats();
     Throwable first = null;
     if (currentBatch != null) {
       try {
@@ -97,6 +127,36 @@ public class LanceDistributedSearchColumnarPartitionReader
     if (first != null) {
       throw new IOException("Failed to close LanceDistributedSearchColumnarPartitionReader", first);
     }
+  }
+
+  /**
+   * Publishes the scanner's counters. Scan stats are cumulative for the whole scan, so they are
+   * collected exactly once; reading diagnostics must never turn a finished search into a failed
+   * task.
+   */
+  private void captureScanStats() {
+    if (scanner == null || statsCollected) {
+      return;
+    }
+    statsCollected = true;
+    try {
+      Optional<ScanStats> stats = scanner.getStats();
+      if (stats.isEmpty()) {
+        return;
+      }
+      metricsTracker.addScanStats(stats);
+      Map<String, Long> counts = stats.get().getAllCounts();
+      if (counts != null) {
+        metricsTracker.addNumRowsScanned(counts.getOrDefault(STAT_ROWS_SCANNED, 0L));
+      }
+    } catch (Throwable ignored) {
+      // best effort: the counters are diagnostics, not correctness
+    }
+  }
+
+  @Override
+  public CustomTaskMetric[] currentMetricsValues() {
+    return metricsTracker.currentMetricsValues();
   }
 
   private static Throwable closeQuietly(AutoCloseable closeable, Throwable carried) {
@@ -116,14 +176,18 @@ public class LanceDistributedSearchColumnarPartitionReader
     executorNamespace =
         ExecutorNamespace.acquire(
             query.getReadOptions(), query.getNamespaceImpl(), query.getNamespaceProperties());
+    long openStart = System.nanoTime();
     dataset =
         Utils.openDatasetBuilder(query.getReadOptions())
             .initialStorageOptions(query.getInitialStorageOptions())
             .build();
+    metricsTracker.addDatasetOpenTimeNs(System.nanoTime() - openStart);
     ScanOptions opts = buildScanOptions(partition);
+    long scanStart = System.nanoTime();
     try {
       scanner = dataset.newScan(opts);
       reader = scanner.scanBatches();
+      metricsTracker.addScannerCreateTimeNs(System.nanoTime() - scanStart);
     } catch (Exception e) {
       throw new IOException(
           "Failed to open distributed search scan for partition: " + describe(partition), e);
@@ -166,6 +230,10 @@ public class LanceDistributedSearchColumnarPartitionReader
     }
 
     ScanOptions.Builder b = new ScanOptions.Builder().nearest(q.build());
+    // The counters behind the SQL metrics come from the scanner, and lance only records them when
+    // asked. The read path sets this too (LanceFragmentScanner); without it every counter reads
+    // zero and a benchmark cannot tell "storage got slower" from "native search got slower".
+    b.collectStats(true);
     // ensure_not_fragment_scan rejects a fragment-restricted nearest scan unless prefilter is
     // set, so a fallback unit always sets it. Indexed units only do what the user asked; a
     // filtered query cannot reach a worker without prefilter=true.

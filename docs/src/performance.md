@@ -195,6 +195,38 @@ How to read these together:
 - **Catalog overhead**: `datasetOpenTimeNs` accumulates per fragment opened. If many fragments are
   opened per task, this can dominate; metadata cache size and namespace caching matter most here.
 
+### Vector search metrics
+
+`VECTOR_SEARCH` planned as Spark tasks (`spark.sql.lance.search.distributed.enabled=true`) reports
+the same metrics on its scan node, one task per index segment or uncovered fragment. Read them a
+little differently than a table scan:
+
+- `batchLoadTimeNs` is the time spent producing the search results: probing the index, scanning
+  candidate codes, computing distances, and fetching the matching rows. `scannerCreateTimeNs`
+  covers `newScan` plus starting the Arrow stream, and `datasetOpenTimeNs` covers opening the
+  dataset on the worker.
+- `numIops` / `numRequests` / `numBytesRead` count what the task pulled from storage. These are what
+  separate "the store got slower" from "the search got slower": if `batchLoadTimeNs` grows while the
+  counters stay flat, the time went to compute; if they grow together, it went to IO.
+- `numIndexComparisons` / `numPartsLoaded` are non-zero only for tasks that searched an index
+  segment; a run that fell back to flat KNN reports zeros there. `numIndicesLoaded` counts whole
+  top-level indices opened by the scanner and usually stays zero for a per-segment search.
+- `numRowsScanned` comes from Lance's own per-scan counter: rows read from storage, including the
+  fetches that assemble the top-k rows. It measures work done rather than rows matched, and is the
+  first thing to compare between two runs — if both read the same rows, a wall-clock difference is
+  not a difference in the work. Lance's `fragments_scanned` counter is deliberately not mapped to
+  `numFragmentsScanned`: it counts physical fragment scans (2 for a task that scans one fragment),
+  so it would not mean what that scan-node column says.
+
+Namespace-executed search (the default) has no equivalent. It returns results through `queryTable`,
+whose response carries Arrow data only, so its scan node shows no Lance metrics at all; attribute
+search performance with the distributed path enabled.
+
+The connector asks Lance to collect these counters (`ScanOptions.collectStats`). Without that flag
+the scanner reports zeros for every IO counter. The counters are published when the scan runs dry,
+so a task that is cancelled or stopped early — a `LIMIT` above the search that lets Spark stop
+reading — can show zeros even though it did the work.
+
 ### Custom Write Metrics
 
 The write path reports two per-task metrics.

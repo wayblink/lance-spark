@@ -110,6 +110,11 @@ forward it as a lower bound and let the search probe further, in which case the 
 different recall for the same tuning. Re-check recall after enabling the flag; raise `nprobes`, or
 use `bypass_vector_index => true` for an exact baseline, if the results need to be comparable.
 
+Each distributed task reports the read-path metrics on its scan node — `numIops`, `numBytesRead`,
+`numIndexComparisons` and the open/create/load timings — which is what lets a slow search be
+attributed to storage or to the search itself. Namespace execution reports none of them. See
+[Performance Tuning](../../performance.md#vector-search-metrics) for how to read the numbers.
+
 A filtered distributed search must pass `prefilter=true`, which returns the true filtered top k.
 Namespace execution defaults to `prefilter=false` and applies the filter after choosing the top k,
 which usually returns fewer rows; a distributed plan cannot reproduce that, so omitting `prefilter`

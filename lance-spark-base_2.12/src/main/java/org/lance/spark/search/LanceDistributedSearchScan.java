@@ -18,11 +18,13 @@ import org.lance.Fragment;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
+import org.lance.spark.read.metric.LanceCustomMetrics;
 import org.lance.spark.utils.FieldPathUtils;
 import org.lance.spark.utils.Utils;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
@@ -99,6 +101,15 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
   @Override
   public PartitionReaderFactory createReaderFactory() {
     return new LanceDistributedSearchPartitionReaderFactory();
+  }
+
+  /**
+   * The same per-task counters the read path reports, so a benchmark can attribute a wall-clock
+   * difference to storage, to native search, or to neither (card #3089).
+   */
+  @Override
+  public CustomMetric[] supportedCustomMetrics() {
+    return LanceCustomMetrics.allMetrics();
   }
 
   @Override

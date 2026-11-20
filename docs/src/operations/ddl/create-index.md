@@ -265,10 +265,43 @@ query-time `refine_factor` and on `nprobes` rather than on any shared model.
 !!! note "Limitations"
     `train = false` is rejected: Lance cannot register an empty vector index. A dimension that is
     not a multiple of 8 is rejected during planning. A vector index on a column that is not a
-    fixed-size list is rejected the same way; declare the column with the table property
-    `'<column>.arrow.fixed-size-list.size'`. [OPTIMIZE INDEX](./optimize-index.md) is rejected too:
-    Lance merges vector segments only when they share IVF centroids, which segment-local statistics
-    do not, so `num_segments` is final until the index is rebuilt.
+    fixed-size list is rejected the same way; see
+    [Rebuilding an existing table](#rebuilding-an-existing-table-so-it-can-be-indexed) for the only
+    way to declare the dimension on a table that already exists. [OPTIMIZE INDEX](./optimize-index.md)
+    is rejected too: Lance merges vector segments only when they share IVF centroids, which
+    segment-local statistics do not, so `num_segments` is final until the index is rebuilt.
+
+#### Rebuilding an existing table so it can be indexed
+
+A vector index needs a fixed-size list, and the only way to declare one is the table property
+`'<column>.arrow.fixed-size-list.size'`. That property is read **while the column is created** — in
+`CREATE TABLE`, or with `SET TBLPROPERTIES` before [`ADD COLUMNS`](../dml/add-columns.md) for a
+future column. It is not a mutable table property: the stored type lives in the dataset schema, not
+in the table config, so `ALTER TABLE ... SET TBLPROPERTIES` on a column that already exists is
+rejected (see [ALTER TABLE limitations](./alter-table.md#limitations)) rather than silently doing
+nothing.
+
+A table written as `ARRAY<FLOAT>` therefore cannot be made indexable in place, and `CREATE INDEX`
+fails with `Column '<column>' must be a fixed-size list of floats to build an vector index`. The way
+out is a rebuild that declares the dimension:
+
+```sql
+CREATE TABLE lance.db.items_fixed
+USING lance
+TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '2560')
+AS SELECT * FROM lance.db.items;
+
+-- compare the row counts before swapping names
+SELECT (SELECT count(*) FROM lance.db.items) AS before_rebuild,
+       (SELECT count(*) FROM lance.db.items_fixed) AS after_rebuild;
+
+ALTER TABLE lance.db.items RENAME TO lance.db.items_old;
+ALTER TABLE lance.db.items_fixed RENAME TO lance.db.items;
+```
+
+The rebuild writes every row of the table again. Values whose length differs from the declared
+dimension fail the write instead of being padded or truncated, which is the point: a fixed-size
+vector column is a promise about the data, not a hint.
 
 ### Full-Text Search Index
 

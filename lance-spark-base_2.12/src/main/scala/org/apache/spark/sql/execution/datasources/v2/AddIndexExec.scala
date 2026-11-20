@@ -917,8 +917,10 @@ object IndexUtils extends Logging {
     if (!VectorUtils.shouldBeFixedSizeList(field.dataType, field.metadata)) {
       throw new IllegalArgumentException(
         s"Column '$column' must be a fixed-size list of floats to build an vector index, got " +
-          s"${field.dataType.simpleString}. Declare it with the table property " +
-          s"'${column}.${VectorUtils.ARROW_FIXED_SIZE_LIST_SIZE_KEY}'")
+          s"${field.dataType.simpleString}. The property " +
+          s"'${VectorUtils.createVectorSizePropertyKey(column)}' is only read while the column " +
+          "is created, so an existing column cannot be converted by setting it: the table has " +
+          "to be rebuilt with the property declared. See CREATE TABLE > Vector Columns.")
     }
     val dimension = field.metadata
       .getLong(VectorUtils.ARROW_FIXED_SIZE_LIST_SIZE_KEY)

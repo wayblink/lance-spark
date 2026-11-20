@@ -43,6 +43,13 @@ Once the column exists, SET rejects these keys, even when setting the current va
 - `<column>.lance.encoding` and the supported `<column>.lance.*` encoding keys:
   `compression`, `compression-level`, `structural-encoding`, `rle-threshold`, and `bss`.
 
+The keys are creation-only because they describe how the column is **stored**, and the stored form
+lives in the dataset schema rather than in the table config. Accepting a SET would leave the config
+claiming a schema the data does not have, so the statement is rejected instead. There is no in-place
+conversion today; a column that needs one of these keys has to be rebuilt. For vector columns that
+is a rebuild with the dimension declared: see
+[Rebuilding an existing table](./create-index.md#rebuilding-an-existing-table-so-it-can-be-indexed).
+
 For directory-backed tables, use `ALTER TABLE` to persist future-column properties because
 `CREATE TABLE` does not persist user properties. See [ADD COLUMNS](../dml/add-columns.md)
 for a blob column example.

@@ -228,6 +228,13 @@ public abstract class BaseVectorIndexDdlTest {
     assertTrue(
         message.contains("fixed-size list"),
         "error must ask for a fixed-size list, got: " + message);
+    // The remedy is a rebuild, not a property: say so, or the next step is a dead end.
+    assertTrue(
+        message.contains("only read while the column is created"),
+        "error must say the property is creation-only, got: " + message);
+    assertTrue(
+        message.contains("has to be rebuilt"),
+        "error must name the rebuild as the only remedy, got: " + message);
   }
 
   @Test

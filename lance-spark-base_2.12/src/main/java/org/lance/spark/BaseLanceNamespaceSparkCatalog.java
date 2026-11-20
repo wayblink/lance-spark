@@ -1080,9 +1080,11 @@ public abstract class BaseLanceNamespaceSparkCatalog
                 + property
                 + "' because column '"
                 + column
-                + "' already exists. Schema and encoding properties must be configured before"
-                + " the column exists. UNSET TBLPROPERTIES removes config without changing"
-                + " the stored schema.");
+                + "' already exists. A schema or encoding property is only read while its column"
+                + " is created, so setting it on an existing column would change nothing. To change"
+                + " how an existing column is stored, rebuild the table with the property declared"
+                + " before the column is created. UNSET TBLPROPERTIES removes config without"
+                + " changing the stored schema.");
       }
     }
   }

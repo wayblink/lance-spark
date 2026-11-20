@@ -100,6 +100,14 @@ Lance supports vector (embedding) columns for AI workloads. These columns are st
 
 ### Creating Vector Columns
 
+!!! warning "Declare the dimension while you create the column"
+    `'<column>.arrow.fixed-size-list.size'` is read when the column is created, not stored as a
+    changeable attribute: it decides whether the column is written as an Arrow fixed-size list or as
+    a variable-length list. A table written without it cannot be given the dimension afterwards
+    (`ALTER TABLE ... SET TBLPROPERTIES` on an existing column is rejected), and a vector index
+    cannot be built on the variable-length form. See
+    [Rebuilding an existing table](create-index.md#rebuilding-an-existing-table-so-it-can-be-indexed).
+
 To create a table with vector columns, use the table property pattern `<column_name>.arrow.fixed-size-list.size` with the dimension as the value:
 
 === "SQL"

@@ -598,11 +598,15 @@ class TestDDLAlterTableProperties:
             CREATE TABLE default.test_table (embedding ARRAY<FLOAT>) USING lance
             TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '756')
         """)
-        with pytest.raises(Exception, match="Cannot set property .* because column .* already exists"):
+        with pytest.raises(
+            Exception, match="Cannot set property .* because column .* already exists"
+        ) as rejected:
             spark.sql(f"""
                 ALTER TABLE default.test_table
                 SET TBLPROPERTIES ('embedding.arrow.fixed-size-list.size' = '{size}')
             """)
+        # Rejected is not enough: the operator needs the way out, and there is only one.
+        assert "rebuild the table" in str(rejected.value)
         assert spark.table("default.test_table").schema["embedding"].metadata[
             "arrow.fixed-size-list.size"
         ] == 756

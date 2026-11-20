@@ -628,6 +628,14 @@ public abstract class BaseVectorCreateTableTest {
               .contains(
                   "Cannot set property 'embedding.arrow.fixed-size-list.size'"
                       + " because column 'embedding' already exists."));
+      // A rejected write must say why it cannot help and what would: the property is read
+      // at column creation, so only a rebuild changes how an existing column is stored.
+      assertTrue(
+          error.getMessage().contains("only read while its column is created"),
+          "error must say the property is creation-only, got: " + error.getMessage());
+      assertTrue(
+          error.getMessage().contains("rebuild the table"),
+          "error must name the rebuild as the remedy, got: " + error.getMessage());
     }
     assertFixedSizeListMetadata(spark.table(fullName).schema(), "embedding", 756);
   }

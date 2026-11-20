@@ -64,19 +64,42 @@ case class RefreshIndexExec(
     val (nsImpl, nsProps, tableId, initialStorageOpts) =
       IndexUtils.extractNamespaceInfo(catalog, lanceDataset, readOptions)
 
-    val segments = new ScalarSegmentIndexJob(
-      session.sparkContext,
-      plan.resolvedName,
-      plan.method,
-      List(plan.column),
-      IndexUtils.toJson(args),
-      plan.buildReadOptions,
-      plan.unindexedFragments,
-      numSegments,
-      nsImpl,
-      nsProps,
-      tableId,
-      initialStorageOpts).run()
+    val segments =
+      if (IndexUtils.vectorSegmentIndexType(plan.method).isDefined) {
+        val options = resolveVectorOptions(lanceDataset, plan)
+        val batches = IndexUtils.batchFragments(
+          plan.unindexedFragments,
+          numSegments,
+          session.sparkContext.defaultParallelism)
+        new VectorSegmentIndexJob(
+          session.sparkContext,
+          plan.resolvedName,
+          plan.column,
+          IndexUtils.vectorDimension(lanceDataset.schema(), plan.column),
+          options.numPartitions,
+          options.numBits,
+          options.distanceType,
+          plan.buildReadOptions,
+          batches,
+          nsImpl,
+          nsProps,
+          tableId,
+          initialStorageOpts).run()
+      } else {
+        new ScalarSegmentIndexJob(
+          session.sparkContext,
+          plan.resolvedName,
+          plan.method,
+          List(plan.column),
+          IndexUtils.toJson(args),
+          plan.buildReadOptions,
+          plan.unindexedFragments,
+          numSegments,
+          nsImpl,
+          nsProps,
+          tableId,
+          initialStorageOpts).run()
+      }
 
     val dataset = Utils.openDatasetBuilder(readOptions).build()
     val fragmentsIndexed =
@@ -111,6 +134,48 @@ case class RefreshIndexExec(
       fragmentsIndexed.toLong,
       segments.size.toLong,
       UTF8String.fromString(plan.resolvedName))))
+  }
+
+  /**
+   * Build parameters for a vector index, taken from the property CREATE INDEX recorded.
+   *
+   * A refresh must reproduce the original build: segments built with a different `num_partitions`
+   * cannot be searched as one index. Options passed on REFRESH are therefore a cross-check, not an
+   * override.
+   */
+  private def resolveVectorOptions(
+      lanceDataset: LanceDataset,
+      plan: RefreshPlan): IndexUtils.VectorIndexOptions = {
+    val key = IndexUtils.vectorParamsPropertyKey(plan.resolvedName)
+    val stored = Option(lanceDataset.properties().get(key)).getOrElse {
+      throw new IllegalArgumentException(
+        s"Index '${plan.resolvedName}' has no recorded build parameters in table property '$key', " +
+          "so REFRESH INDEX cannot reproduce the build. Rebuild it with " +
+          "ALTER TABLE ... CREATE INDEX.")
+    }
+    val recorded = IndexUtils.parseVectorParams(plan.resolvedName, stored)
+
+    val requested = IndexUtils.vectorOptionOverrides(args)
+    requested.numPartitions.foreach(asked =>
+      requireMatching("num_partitions", asked, recorded.numPartitions))
+    requested.numBits.foreach(asked => requireMatching("num_bits", asked, recorded.numBits))
+    requested.distanceType.foreach { asked =>
+      if (asked != recorded.distanceType) {
+        throw new IllegalArgumentException(
+          s"REFRESH INDEX metric = '${asked.sqlName}' conflicts with " +
+            s"'${recorded.distanceType.sqlName}' recorded when the index was built. Refresh must " +
+            "reproduce the original build; rebuild the index to change it.")
+      }
+    }
+    recorded
+  }
+
+  private def requireMatching(name: String, asked: Int, recorded: Int): Unit = {
+    if (asked != recorded) {
+      throw new IllegalArgumentException(
+        s"REFRESH INDEX $name = $asked conflicts with $recorded recorded when the index was " +
+          "built. Refresh must reproduce the original build; rebuild the index to change it.")
+    }
   }
 
   private def noOpResult(resolvedName: String): InternalRow =
@@ -155,12 +220,20 @@ case class RefreshIndexExec(
     val segments = matched.head._2
 
     val indexType = segments.head.indexType()
-    val method = Option(indexType).flatMap(IndexUtils.methodForIndexType).getOrElse {
-      val described = Option(indexType).map(_.name()).getOrElse("unknown")
-      throw new UnsupportedOperationException(
-        s"Spark SQL cannot build index type $described, so '$indexName' cannot be refreshed here. " +
-          "Maintain it through the Lance SDK, which is also where it was created.")
-    }
+    // A built IVF_RQ index reports the generic VECTOR type rather than IVF_RQ, so the vector branch
+    // is identified by that name and keeps the method the build uses.
+    val isVector = indexType == IndexType.VECTOR
+    val method =
+      if (isVector) {
+        "ivf_rq"
+      } else {
+        Option(indexType).flatMap(IndexUtils.methodForIndexType).getOrElse {
+          val described = Option(indexType).map(_.name()).getOrElse("unknown")
+          throw new UnsupportedOperationException(
+            s"Spark SQL cannot build index type $described, so '$indexName' cannot be refreshed " +
+              "here. Maintain it through the Lance SDK, which is also where it was created.")
+        }
+      }
 
     val fieldIds = segments.head.fields()
     if (fieldIds == null || fieldIds.isEmpty) {

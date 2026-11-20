@@ -24,9 +24,9 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericInternalRow}
 import org.apache.spark.sql.catalyst.plans.logical.{AddIndexOutputType, LanceNamedArgument}
-import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog}
+import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog, TableChange}
 import org.apache.spark.sql.functions.lit
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{StructField, StructType}
 import org.apache.spark.sql.util.LanceArrowUtils
 import org.apache.spark.sql.util.LanceSerializeUtil.{decode, encode}
 import org.apache.spark.unsafe.types.UTF8String
@@ -37,7 +37,7 @@ import org.lance.operation.{CreateIndex => AddIndexOperation}
 import org.lance.schema.{LanceField, LanceSchema}
 import org.lance.spark.{BaseLanceNamespaceSparkCatalog, LanceDataset, LanceRuntime, LanceSparkReadOptions}
 import org.lance.spark.arrow.LanceArrowWriter
-import org.lance.spark.utils.{CloseableUtil, FieldPathUtils, Utils}
+import org.lance.spark.utils.{CloseableUtil, FieldPathUtils, Utils, VectorUtils}
 import org.lance.spark.write.SingleBatchArrowReader
 
 import java.util.{Collections, Locale, UUID}
@@ -90,6 +90,7 @@ case class AddIndexExec(
     val indexType = IndexUtils.buildIndexType(method)
     val btreeBuildMode = IndexUtils.btreeBuildMode(indexType, args)
     val scalarSegmentIndexType = IndexUtils.scalarSegmentIndexType(method)
+    val vectorSegmentIndexType = IndexUtils.vectorSegmentIndexType(method)
 
     // Plan and build at one pinned version; the commit opens the live dataset.
     val (fragmentWorkloads, canonicalColumns, buildReadOptions) = {
@@ -121,7 +122,7 @@ case class AddIndexExec(
       throw new IllegalArgumentException(
         "num_segments is only supported for BTREE indexes with build_mode='fragment'")
     }
-    if (numSegmentsOpt.isDefined && scalarSegmentIndexType.isEmpty) {
+    if (numSegmentsOpt.isDefined && scalarSegmentIndexType.isEmpty && vectorSegmentIndexType.isEmpty) {
       throw new IllegalArgumentException(
         s"num_segments is not supported for ${indexType.name()} indexes")
     }
@@ -130,6 +131,25 @@ case class AddIndexExec(
         "num_segments is not supported with train=false: a deferred index performs no segmented build")
     }
     val validatedNumSegments: Option[Int] = numSegmentsOpt.map(IndexUtils.parseNumSegments)
+
+    // Vector indexes are validated here so a bad dimension or option fails during planning rather
+    // than inside a Spark task, and so the empty/deferred paths below never reach the Lance build
+    // (Lance cannot create an empty vector index).
+    val vectorOptions: Option[(IndexUtils.VectorOptionOverrides, Int)] =
+      vectorSegmentIndexType.map { _ =>
+        val parsed = IndexUtils.vectorOptionOverrides(args)
+        if (!train) {
+          throw new IllegalArgumentException(
+            "train=false is not supported for IVF_RQ indexes: Lance cannot create an empty vector " +
+              "index. Build it with CREATE INDEX instead")
+        }
+        if (fragmentIds.isEmpty) {
+          throw new IllegalArgumentException(
+            "Cannot create an IVF_RQ index on an empty table: a segment derives its statistics " +
+              "from its own fragments and there are none")
+        }
+        (parsed, IndexUtils.vectorDimension(lanceDataset.schema(), canonicalColumns.head))
+      }
 
     // train=false, or an empty table: commit an empty index on the driver and skip data
     // processing. Index and option validation above still applies to empty tables.
@@ -150,6 +170,49 @@ case class AddIndexExec(
 
     val (nsImpl, nsProps, tableId, initialStorageOpts) =
       IndexUtils.extractNamespaceInfo(catalog, lanceDataset, readOptions)
+
+    // Vector segment indexes build one independent segment per fragment batch, each with centroids
+    // derived from that batch only.
+    if (vectorSegmentIndexType.isDefined) {
+      val (overrides, dimension) = vectorOptions.get
+      // The batches are planned here, not inside the job, because the default partition count is
+      // the square root of the rows a segment covers: the recording below must see the same value
+      // the tasks use.
+      val batches = IndexUtils.batchFragments(
+        fragmentWorkloads,
+        validatedNumSegments,
+        session.sparkContext.defaultParallelism)
+      val options = IndexUtils.vectorIndexOptions(
+        overrides,
+        IndexUtils.defaultNumPartitions(
+          IndexUtils.rowsPerSegment(fragmentWorkloads, batches.size)))
+      val segmentJob = new VectorSegmentIndexJob(
+        session.sparkContext,
+        indexName,
+        canonicalColumns.head,
+        dimension,
+        options.numPartitions,
+        options.numBits,
+        options.distanceType,
+        buildReadOptions,
+        batches,
+        nsImpl,
+        nsProps,
+        tableId,
+        initialStorageOpts)
+      val segments = segmentJob.run()
+      val indexed = commitIndexSegments(readOptions, canonicalColumns.head, segments)
+      // Record the parameters so REFRESH INDEX can reproduce this build; see
+      // vectorParamsPropertyKey for why Lance metadata cannot answer that question.
+      catalog.alterTable(
+        ident,
+        TableChange.setProperty(
+          IndexUtils.vectorParamsPropertyKey(indexName),
+          IndexUtils.vectorParamsJson(options)))
+      return Seq(new GenericInternalRow(Array[Any](
+        indexed.toLong,
+        UTF8String.fromString(indexName))))
+    }
 
     if (btreeBuildMode.contains("range")) {
       val segments = new RangeBasedBTreeIndexJob(
@@ -613,7 +676,8 @@ object IndexUtils extends Logging {
     "bloomfilter" -> IndexType.BLOOM_FILTER,
     "rtree" -> IndexType.RTREE,
     "fts" -> IndexType.INVERTED,
-    "inverted" -> IndexType.INVERTED)
+    "inverted" -> IndexType.INVERTED,
+    "ivf_rq" -> IndexType.IVF_RQ)
 
   private val scalarSegmentIndexTypes: Set[IndexType] = Set(
     IndexType.BTREE,
@@ -624,6 +688,10 @@ object IndexUtils extends Logging {
     IndexType.BLOOM_FILTER,
     IndexType.RTREE,
     IndexType.INVERTED)
+
+  // Vector index types support the same distributed segment path as the scalar ones, but take
+  // VectorIndexParams and derive their per-segment centroids from the segment's own fragments.
+  private val vectorSegmentIndexTypes: Set[IndexType] = Set(IndexType.IVF_RQ)
 
   // Field-shape requirements are independent of the distributed execution path. These index
   // types reject container fields in Lance Core, so validate them before launching Spark tasks.
@@ -655,16 +723,220 @@ object IndexUtils extends Logging {
     IndexType.NGRAM -> "ngram",
     IndexType.BLOOM_FILTER -> "bloomfilter",
     IndexType.RTREE -> "rtree",
-    IndexType.INVERTED -> "fts")
+    IndexType.INVERTED -> "fts",
+    IndexType.IVF_RQ -> "ivf_rq")
 
   def scalarSegmentIndexType(method: String): Option[IndexType] =
     methodToIndexTypes
       .get(method.toLowerCase(Locale.ROOT))
       .filter(scalarSegmentIndexTypes.contains)
 
+  /** The index type for a vector method name, if the method builds a vector index. */
+  def vectorSegmentIndexType(method: String): Option[IndexType] =
+    methodToIndexTypes
+      .get(method.toLowerCase(Locale.ROOT))
+      .filter(vectorSegmentIndexTypes.contains)
+
+  /**
+   * Options accepted by `USING ivf_rq`. `train` and `num_segments` are consumed by the Spark layer
+   * like they are for scalar methods; the rest configure the Lance vector build.
+   */
+  private val VectorOptions: Set[String] =
+    Set("train", "num_segments", "num_partitions", "num_bits", "metric")
+
+  case class VectorIndexOptions(
+      numPartitions: Int,
+      numBits: Int,
+      distanceType: VectorDistanceType)
+
+  /**
+   * Table property holding a vector index's build parameters.
+   *
+   * Lance records a built index's parameters inside the index files, not as metadata a command can
+   * read back, so REFRESH INDEX would otherwise have to guess them - and a segment built with a
+   * different `num_partitions` cannot be searched together with the existing ones. Recording them
+   * here is what lets a refresh reproduce the original build.
+   */
+  def vectorParamsPropertyKey(indexName: String): String =
+    s"lance.index.$indexName.vector"
+
+  def vectorParamsJson(options: VectorIndexOptions): String = {
+    val node: ObjectNode = jsonMapper.createObjectNode()
+    node.put("num_partitions", options.numPartitions)
+    node.put("num_bits", options.numBits)
+    node.put("metric", options.distanceType.sqlName)
+    jsonMapper.writeValueAsString(node)
+  }
+
+  def parseVectorParams(indexName: String, json: String): VectorIndexOptions = {
+    try {
+      val node = jsonMapper.readTree(json)
+      val numPartitions = node.path("num_partitions").asInt(1)
+      val numBits = node.path("num_bits").asInt(4)
+      val metric = node.path("metric").asText(VectorDistanceType.L2.sqlName)
+      val distanceType = VectorDistanceType.parse(metric).getOrElse {
+        throw new IllegalArgumentException(s"Unsupported metric '$metric'")
+      }
+      VectorIndexOptions(numPartitions, numBits, distanceType)
+    } catch {
+      case e: Exception =>
+        throw new IllegalArgumentException(
+          s"Index '$indexName' has unreadable build parameters in ${vectorParamsPropertyKey(indexName)}: " +
+            s"$json. Rebuild it with ALTER TABLE ... CREATE INDEX.",
+          e)
+    }
+  }
+
+  /** Parses and validates the `WITH` clause of a vector index, rejecting unknown options. */
+  /** Options a command actually spelled out; absent options must not masquerade as defaults. */
+  case class VectorOptionOverrides(
+      numPartitions: Option[Int],
+      numBits: Option[Int],
+      distanceType: Option[VectorDistanceType])
+
+  /** Only the options the caller spelled out, rejecting options a vector index does not accept. */
+  def vectorOptionOverrides(args: Seq[LanceNamedArgument]): VectorOptionOverrides = {
+    val unknown = args.map(_.name).filterNot(VectorOptions.contains).distinct
+    if (unknown.nonEmpty) {
+      throw new IllegalArgumentException(
+        s"Unsupported option(s) for vector indexes: ${unknown.sorted.mkString(", ")}. " +
+          s"Supported options: ${VectorOptions.toSeq.sorted.mkString(", ")}")
+    }
+    VectorOptionOverrides(
+      numPartitions =
+        args.find(_.name == "num_partitions").map(parseVectorInt("num_partitions", _)),
+      numBits = args.find(_.name == "num_bits").map(parseVectorInt("num_bits", _)),
+      distanceType = args.find(_.name == "metric").map {
+        case LanceNamedArgument(_, value) =>
+          val text = String.valueOf(value)
+          VectorDistanceType.parse(text).getOrElse {
+            throw new IllegalArgumentException(
+              s"metric must be one of ${VectorDistanceType.all.map(_.sqlName).mkString(", ")}, " +
+                s"got: $text")
+          }
+      })
+  }
+
+  /** Upper bound on an explicit partition count: the centroid matrix is partitions x dimension. */
+  val MaxPartitions = 65536
+
+  /**
+   * Cap on the default partition count.
+   *
+   * <p>The default follows the usual IVF rule of thumb, `sqrt(rows per segment)`, but a segment's
+   * model is trained inside one Spark task, so an unbounded square root would put unbounded work
+   * behind one task on a large table.
+   */
+  val MaxDefaultPartitions = 4096
+
+  /** Partition count for a segment covering `rowsPerSegment` live rows. */
+  def defaultNumPartitions(rowsPerSegment: Double): Int = {
+    if (rowsPerSegment < 1.0d) {
+      1
+    } else {
+      math.max(1, math.min(MaxDefaultPartitions, math.round(math.sqrt(rowsPerSegment)).toInt))
+    }
+  }
+
+  /** Average number of live rows one of `numSegments` segments covers. */
+  def rowsPerSegment(fragments: List[FragmentWorkload], numSegments: Int): Double = {
+    if (numSegments <= 0) {
+      0.0d
+    } else {
+      fragments.iterator.map(_.numRows.toDouble).sum / numSegments
+    }
+  }
+
+  /** Resolves a vector index's build options, filling in the defaults the planner computed. */
+  def vectorIndexOptions(
+      overrides: VectorOptionOverrides,
+      fallbackPartitions: Int): VectorIndexOptions = {
+    val numPartitions = overrides.numPartitions.getOrElse(fallbackPartitions)
+    if (numPartitions < 1) {
+      throw new IllegalArgumentException(
+        s"num_partitions must be a positive integer, got: $numPartitions")
+    }
+    if (numPartitions > MaxPartitions) {
+      throw new IllegalArgumentException(
+        s"num_partitions must be at most $MaxPartitions, got: $numPartitions")
+    }
+
+    val numBits = overrides.numBits.getOrElse(4)
+    if (numBits < 1 || numBits > 8) {
+      throw new IllegalArgumentException(
+        s"num_bits must be between 1 and 8 for RaBitQ, got: $numBits")
+    }
+
+    VectorIndexOptions(
+      numPartitions,
+      numBits,
+      overrides.distanceType.getOrElse(VectorDistanceType.L2))
+  }
+
+  private def parseVectorInt(name: String, arg: LanceNamedArgument): Int = arg.value match {
+    case null => throw new IllegalArgumentException(s"$name must be an integer, got: null")
+    case n: Number =>
+      val asLong = n.longValue()
+      if (asLong < Int.MinValue || asLong > Int.MaxValue) {
+        throw new IllegalArgumentException(
+          s"$name must be an integer that fits in Int, got: $asLong")
+      }
+      asLong.toInt
+    case other => throw new IllegalArgumentException(s"$name must be an integer, got: $other")
+  }
+
+  /**
+   * Resolves the vector column's dimension, rejecting anything RaBitQ cannot quantize.
+   *
+   * RaBitQ packs one code per 8 dimensions, so Lance rejects a dimension that is not a multiple of 8.
+   * Checking here turns that into a planning-time error that names the column instead of a failed
+   * Spark task.
+   */
+  def vectorDimension(schema: StructType, column: String): Int = {
+    val parts = column.split('.')
+    var current: StructType = schema
+    var field: StructField = null
+    var position = 0
+    while (position < parts.length) {
+      val name = parts(position)
+      field = current.fields
+        .find(candidate => candidate.name.equalsIgnoreCase(name))
+        .getOrElse(throw new IllegalArgumentException(
+          s"Column '$column' does not exist, so it cannot be indexed"))
+      if (position < parts.length - 1) {
+        field.dataType match {
+          case nested: StructType => current = nested
+          case other =>
+            throw new IllegalArgumentException(
+              s"Column '$column' does not exist: '${parts.take(position + 1).mkString(".")}' is " +
+                s"${other.simpleString}, not a struct")
+        }
+      }
+      position += 1
+    }
+    if (!VectorUtils.shouldBeFixedSizeList(field.dataType, field.metadata)) {
+      throw new IllegalArgumentException(
+        s"Column '$column' must be a fixed-size list of floats to build an vector index, got " +
+          s"${field.dataType.simpleString}. Declare it with the table property " +
+          s"'${column}.${VectorUtils.ARROW_FIXED_SIZE_LIST_SIZE_KEY}'")
+    }
+    val dimension = field.metadata
+      .getLong(VectorUtils.ARROW_FIXED_SIZE_LIST_SIZE_KEY)
+      .toInt
+    if (dimension % 8 != 0) {
+      throw new IllegalArgumentException(
+        s"Column '$column' has dimension $dimension, but a RaBitQ index requires a dimension " +
+          "divisible by 8")
+    }
+    dimension
+  }
+
   /** The SQL method name for an index type that supports segmented builds, if any. */
   def methodForIndexType(indexType: IndexType): Option[String] =
-    Option(indexType).filter(scalarSegmentIndexTypes.contains).flatMap(methodByIndexType.get)
+    Option(indexType)
+      .filter(indexType =>
+        scalarSegmentIndexTypes.contains(indexType) || vectorSegmentIndexTypes.contains(indexType))
+      .flatMap(methodByIndexType.get)
 
   private val SystemIndexNames: Set[String] = Set("__lance_frag_reuse", "__lance_mem_wal")
 

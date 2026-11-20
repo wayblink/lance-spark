@@ -768,4 +768,32 @@ class IndexUtilsTest {
       () => IndexUtils.parseNumSegments(LanceNamedArgument("num_segments", null)))
   }
 
+  @Test
+  def defaultNumPartitions_followsTheSquareRootOfSegmentRows(): Unit = {
+    assertEquals(8, IndexUtils.defaultNumPartitions(64.0d))
+    assertEquals(5, IndexUtils.defaultNumPartitions(25.0d))
+    assertEquals(1, IndexUtils.defaultNumPartitions(0.0d))
+    assertEquals(1, IndexUtils.defaultNumPartitions(0.5d))
+    assertEquals(IndexUtils.MaxDefaultPartitions, IndexUtils.defaultNumPartitions(1.0e12d))
+  }
+
+  @Test
+  def rowsPerSegment_averagesTheFragmentWorkloads(): Unit = {
+    assertEquals(30.0d, IndexUtils.rowsPerSegment(fragmentWorkloads(20L, 40L), 2), 1e-9d)
+    assertEquals(0.0d, IndexUtils.rowsPerSegment(Nil, 0), 1e-9d)
+  }
+
+  @Test
+  def vectorIndexOptions_fillsThePlannerDefaultAndCapsExplicitValues(): Unit = {
+    val overrides = IndexUtils.VectorOptionOverrides(None, None, None)
+    assertEquals(6, IndexUtils.vectorIndexOptions(overrides, 6).numPartitions)
+
+    val error = assertThrows(
+      classOf[IllegalArgumentException],
+      () => IndexUtils.vectorIndexOptions(overrides, IndexUtils.MaxPartitions + 1))
+    assertTrue(
+      error.getMessage.contains(IndexUtils.MaxPartitions.toString),
+      s"error must quote the bound, got: ${error.getMessage}")
+  }
+
 }

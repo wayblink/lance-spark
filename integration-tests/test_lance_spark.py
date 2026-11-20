@@ -1283,6 +1283,99 @@ class TestDDLIndex:
         assert query_result[0].id == 50
 
 
+@pytest.mark.rest_dir_compatible
+class TestDDLVectorIndex:
+    """Test the IVF + RaBitQ vector index built by CREATE INDEX ... USING ivf_rq."""
+
+    def _create_vector_table(self, spark, table, dimension, rows):
+        spark.sql(f"""
+            CREATE TABLE {table} (
+                id INT NOT NULL,
+                vector ARRAY<FLOAT> NOT NULL
+            ) USING lance
+            TBLPROPERTIES ('vector.arrow.fixed-size-list.size' = '{dimension}')
+        """)
+        data = [(i, [float(i)] * dimension) for i in range(rows)]
+        (
+            spark.createDataFrame(data, "id INT, vector ARRAY<FLOAT>")
+            .coalesce(1)
+            .writeTo(table)
+            .append()
+        )
+
+    def test_create_ivf_rq_index_and_search(self, spark):
+        """The index is built by Spark SQL and answered by VECTOR_SEARCH."""
+        _require_sql_search_backend(spark)
+        self._create_vector_table(spark, "default.vec_items", 8, 96)
+
+        result = spark.sql("""
+            ALTER TABLE default.vec_items
+            CREATE INDEX idx_vec USING ivf_rq (vector)
+            WITH (num_bits = 8, num_segments = 2)
+        """).collect()
+
+        assert len(result) == 1
+        assert result[0][1] == "idx_vec"
+        assert result[0][0] > 0, "the build must index at least one fragment"
+        _assert_lance_index_metadata(spark, "default.vec_items", "idx_vec", "VECTOR")
+
+        hits = spark.sql("""
+            SELECT id, _distance
+            FROM VECTOR_SEARCH(
+                table => 'default.vec_items',
+                query_vector => array(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                vector_column => 'vector',
+                k => 3,
+                refine_factor => 10)
+            ORDER BY _distance, id
+        """).collect()
+
+        assert len(hits) == 3
+        assert hits[0].id == 0, "the zero vector must be the nearest neighbour"
+        assert hits[0]["_distance"] == pytest.approx(0.0)
+
+    def test_refresh_ivf_rq_index_covers_new_rows(self, spark):
+        """REFRESH INDEX indexes only the appended fragments."""
+        _require_sql_search_backend(spark)
+        self._create_vector_table(spark, "default.vec_refresh", 8, 32)
+        spark.sql("""
+            ALTER TABLE default.vec_refresh
+            CREATE INDEX idx_vec USING ivf_rq (vector) WITH (num_bits = 8, num_segments = 1)
+        """)
+
+        appended = [(-1, [0.0] * 8)]
+        (
+            spark.createDataFrame(appended, "id INT, vector ARRAY<FLOAT>")
+            .coalesce(1)
+            .writeTo("default.vec_refresh")
+            .append()
+        )
+
+        refreshed = spark.sql("ALTER TABLE default.vec_refresh REFRESH INDEX idx_vec").collect()
+        assert len(refreshed) == 1
+        assert refreshed[0][2] == "idx_vec"
+        assert refreshed[0][0] > 0, "the refresh must cover the appended fragment"
+
+    def test_ivf_rq_rejects_dimension_not_divisible_by_8(self, spark):
+        """RaBitQ packs codes per 8 dimensions, so other widths are rejected during planning."""
+        self._create_vector_table(spark, "default.vec_bad_dim", 4, 8)
+
+        with pytest.raises(Exception, match="divisible by 8"):
+            spark.sql("""
+                ALTER TABLE default.vec_bad_dim CREATE INDEX bad USING ivf_rq (vector)
+            """)
+
+    def test_ivf_rq_rejects_num_bits_out_of_range(self, spark):
+        """num_bits is the RaBitQ code width and must stay within 1..8."""
+        self._create_vector_table(spark, "default.vec_bad_bits", 8, 8)
+
+        with pytest.raises(Exception, match="num_bits"):
+            spark.sql("""
+                ALTER TABLE default.vec_bad_bits
+                CREATE INDEX bad USING ivf_rq (vector) WITH (num_bits = 9)
+            """)
+
+
 class TestDDLOptimize:
     """Test DDL OPTIMIZE operations for compacting table fragments."""
 

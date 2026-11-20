@@ -64,6 +64,20 @@ Use positional arguments for simple calls and Spark 3.4 compatibility.
 
 The result includes the requested table columns and a nullable `_distance` float column. If `with_row_id => true`, or if `_rowid` is listed in `columns`, the result also includes Lance row ids.
 
+## Segment-local vector indexes
+
+An `ivf_rq` index is stored as independent segments, each covering a contiguous run of fragments and
+carrying its own IVF centroids and RaBitQ rotation. There is no shared model across segments, so
+`nprobes` and `refine_factor` apply **per segment**. A segment with one IVF list probes that list
+however small `nprobes` is. A segment with more lists probes at most `nprobes` of them, so values
+below the partition count trade recall for speed; leaving `nprobes` unset uses Lance's default,
+which probes every list for the segment sizes we measured. `refine_factor` over-fetches candidates
+and re-scores them against the stored vectors, so it recovers the loss from coarse codes.
+
+Use `refine_factor >= 10` for `num_bits >= 4` and `>= 30` for `1`-bit codes. With 8-bit codes and
+`refine_factor = 10` the distributed result reproduces an exact `bypass_vector_index = true` scan row
+for row; narrower candidate sets trade recall for less re-reading.
+
 ## Execution
 
 By default, Spark plans `VECTOR_SEARCH` with one input partition and calls the Lance namespace

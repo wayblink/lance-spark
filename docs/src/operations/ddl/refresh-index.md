@@ -127,6 +127,29 @@ operation retires one while the build runs, it is excluded and a warning names i
 Planning and building both run against a single pinned table version, so every task sees the
 fragment set the driver planned over.
 
+## Vector indexes
+
+`ivf_rq` indexes can be refreshed. Lance records a built index's parameters inside the index files
+rather than as metadata a command can read back, so `CREATE INDEX` also stores them in the table
+property `lance.index.<index_name>.vector`. `REFRESH INDEX` reads that property and reproduces the
+original build:
+
+```sql
+INSERT INTO lance.db.items VALUES ...;
+ALTER TABLE lance.db.items REFRESH INDEX item_vec;
+```
+
+Options passed to `REFRESH INDEX` are a cross-check, not an override. A `num_partitions`,
+`num_bits`, or `metric` that differs from the recorded value fails the command, because segments
+built with a different configuration cannot be searched as one index. If the property is missing
+(the index predates this connector, or it was unset), the refresh is rejected and the index has to be
+rebuilt with `CREATE INDEX`.
+
+!!! note "Vector segments cannot be merged"
+    [OPTIMIZE INDEX](./optimize-index.md) is rejected for vector indexes: Lance merges vector
+    segments only when they share IVF centroids, and a segment built with segment-local statistics
+    does not. Its `num_segments` is therefore final; rebuild with `CREATE INDEX` to change it.
+
 ## Index Method Options
 
 `REFRESH INDEX` builds its segments from the options in its own `WITH` clause; options you leave out

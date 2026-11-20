@@ -19,7 +19,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{LanceNamedArgument, LanceOpt
 import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog}
 import org.apache.spark.unsafe.types.UTF8String
 import org.lance.Dataset
-import org.lance.index.{Index, IndexCriteria, OptimizeOptions}
+import org.lance.index.{Index, IndexCriteria, IndexType, OptimizeOptions}
 import org.lance.operation.CreateIndex
 import org.lance.spark.LanceDataset
 import org.lance.spark.utils.Utils
@@ -97,6 +97,24 @@ case class LanceOptimizeIndexExec(
     IndexState(description.getSegments.size().toLong)
   }
 
+  /**
+   * Lance can only merge vector segments that were built from the same IVF centroids. Segment-local
+   * statistics are what makes this connector's vector build distributed with no global pass, so its
+   * segments deliberately do not share centroids and cannot be merged; reject before the native
+   * build fails.
+   */
+  private def requireMergeableIndexType(dataset: Dataset): Unit = {
+    val vectorSegment = dataset.getIndexes.asScala.exists { index =>
+      indexName.equalsIgnoreCase(index.name()) && index.indexType() == IndexType.VECTOR
+    }
+    if (vectorSegment) {
+      throw new IllegalArgumentException(
+        s"Cannot optimize vector index '$indexName': Lance only merges vector segments that share " +
+          "IVF centroids, and a segment built with segment-local statistics does not. Rebuild the " +
+          "index with ALTER TABLE ... CREATE INDEX to change its segment layout.")
+    }
+  }
+
   private def requiredFragments(index: Index): Set[Integer] = {
     val fragments = index.fragments()
     if (!fragments.isPresent) {
@@ -152,6 +170,7 @@ case class LanceOptimizeIndexExec(
       .initialStorageOptions(lanceDataset.getInitialStorageOptions)
       .build()
     try {
+      requireMergeableIndexType(dataset)
       val before = indexState(dataset)
       val beforeVersion = dataset.version()
       dataset.optimizeIndices(options)

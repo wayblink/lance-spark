@@ -33,6 +33,7 @@ The following index methods are supported:
 | `rtree`       | R-tree index for GeoArrow geometry columns.                                   |
 | `fts`         | Full-text search (inverted) index for text search on string columns.          |
 | `inverted`    | Alias for `fts`; creates the same full-text inverted index.                   |
+| `ivf_rq`      | IVF partition search over RaBitQ codes, for vector similarity search.         |
 
 ## Options
 
@@ -226,6 +227,49 @@ can be represented by a struct carrying `ARROW:extension:name=geoarrow.point` me
 
 Lance validates each method's column type and parameters during index creation.
 
+### Vector Index (IVF + RaBitQ)
+
+Create a vector index on a fixed-size list of floats. The dimension must be a multiple of 8, which
+is what RaBitQ packs its codes into:
+
+=== "SQL"
+    ```sql
+    ALTER TABLE lance.db.items CREATE INDEX item_vec USING ivf_rq (embedding) WITH (
+        metric = 'l2',
+        num_partitions = 256,   -- IVF lists per segment; default is sqrt(rows per segment)
+        num_bits = 4,
+        num_segments = 8
+    );
+    ```
+
+| Option           | Type    | Description                                                                                     |
+|------------------|---------|-------------------------------------------------------------------------------------------------|
+| `metric`         | String  | `l2` (default), `cosine`, or `dot`. Aliases are normalized to the canonical name.               |
+| `num_partitions` | Integer | IVF lists per segment. Defaults to `sqrt(rows per segment)`, capped at `4096`; explicit values are capped at `65536`. A task builds a `num_partitions × dimension` float centroid matrix, so very large values cost heap on executors. |
+| `num_bits`       | Integer | RaBitQ bits per dimension, `1` to `8`. Default `4`.                                              |
+| `num_segments`   | Integer | Number of segments to build in parallel, clamped to the fragment count. Defaults to `min(fragment_count, spark.default.parallelism)`. |
+
+Query the index with the [VECTOR_SEARCH](../dql/vector-search.md) table function. Pass
+`refine_factor` to over-fetch candidates and re-score them against the original vectors: `10` is the
+recommended floor for `num_bits = 4` and above, and `1`-bit codes need `30` or more because the
+codes are far coarser.
+
+Each segment derives its IVF centroids from the fragments it covers and is built independently, so
+the build is distributed with no global training pass and no data redistribution: one Spark task per
+segment, then an atomic commit on the driver. A segment with one partition uses the mean of its
+vectors as the centroid. More partitions make the segment run its own k-means over a sample of its
+own vectors, which is why `num_partitions` is a per-segment count rather than a table-wide one. The
+trade-off is that every segment's statistics are local, which is why recall depends on the
+query-time `refine_factor` and on `nprobes` rather than on any shared model.
+
+!!! note "Limitations"
+    `train = false` is rejected: Lance cannot register an empty vector index. A dimension that is
+    not a multiple of 8 is rejected during planning. A vector index on a column that is not a
+    fixed-size list is rejected the same way; declare the column with the table property
+    `'<column>.arrow.fixed-size-list.size'`. [OPTIMIZE INDEX](./optimize-index.md) is rejected too:
+    Lance merges vector segments only when they share IVF centroids, which segment-local statistics
+    do not, so `num_segments` is final until the index is rebuilt.
+
 ### Full-Text Search Index
 
 Create an FTS index on a text column:
@@ -311,7 +355,7 @@ The `CREATE INDEX` command operates as follows:
 
 ## Notes and Limitations
 
-- **Index Methods**: The `zonemap`, `bitmap`, `label_list`, `ngram`, `bloomfilter`, `rtree`, `btree`, and `fts` (or `inverted`) methods are supported for index creation.
+- **Index Methods**: The `zonemap`, `bitmap`, `label_list`, `ngram`, `bloomfilter`, `rtree`, `btree`, `fts` (or `inverted`), and `ivf_rq` methods are supported for index creation.
 - **Indexed Column Count**: All supported index methods currently support exactly one indexed column.
 - **Index Replacement**: If you create an index with the same name as an existing one, the old index will be replaced by the new one.
 - **Deferred Training**: With `train = false` the index is registered empty and is populated later, either by re-running `CREATE INDEX` (a full distributed build that replaces the empty index) or through `ALTER TABLE ... OPTIMIZE INDEX` for driver-side incremental maintenance. The table-level `OPTIMIZE` command compacts fragments and does not train deferred indexes.

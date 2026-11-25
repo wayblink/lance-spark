@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Reviewed formal runner: one unique matrix, five sequential cells, no implicit cluster work."""
+"""Reviewed formal runner: one unique matrix, five sequential cells, no implicit cluster work.
+
+Window policy (user decision 2026-11-25T16:40+08:00): a cell is accepted when every measured
+sample has bounded, API-healthy polling evidence around it, the job finished SUCCEEDED and its own
+BASELINE_DONE marker is in the driver log. A foreign benchmark/unknown pod that overlaps the
+sample window is recorded in ``foreign_observed``/``contamination`` and only clears
+``exclusive_window_valid``; it never voids the cell and never stops the matrix. Nothing here
+deletes, stops, patches or reschedules another team's job.
+"""
 import datetime
 import json
 import os
@@ -15,6 +23,8 @@ import pilot
 POLL_SECONDS = 20
 # Maximum tolerated distance from any measured instant to the nearest window observation.
 COVERAGE_SECONDS = POLL_SECONDS + 15
+# Bounded foreign summary kept on the verdict; ``foreign_observed_total`` carries the real count.
+FOREIGN_SUMMARY_LIMIT = 20
 
 # Driver UIDs whose own evidence proves SparkContext stopped and no executor remains.
 # This is an explicit, UID-fenced allowlist; a replacement pod or any executor revokes it.
@@ -29,6 +39,16 @@ BACKGROUND_TOKENS = (
 BENCHMARK_TOKENS = (
     "tpcds", "tpc", "fmt", "format", "bench", "topk", "oss", "pure", "lance-iceberg",
 )
+
+# Object-store settings every driver and executor needs; values come from the platform at run time
+# and are redacted by ``placeholder_storage`` when a dry-run prints a cell command.
+STORAGE_ENV_ROLES = {"AWS_ACCESS_KEY_ID": "key", "AWS_SECRET_ACCESS_KEY": "secret",
+                     "AWS_ENDPOINT_URL": "endpoint", "AWS_ENDPOINT": "endpoint",
+                     "AWS_REGION": "region", "AWS_ALLOW_HTTP": "allow_http"}
+STORAGE_ENV_SCOPES = ("spark.kubernetes.driverEnv.", "spark.executorEnv.")
+STORAGE_LITERALS = {"spark.sql.catalog.lance.storage.region": "us-east-1",
+                    "spark.sql.catalog.lance.storage.aws_allow_http": "true",
+                    "spark.sql.catalog.lance.storage.virtual_hosted_style_request": "false"}
 
 
 def _pod_text(pod):
@@ -122,27 +142,103 @@ def delete_options(uid):
     return {"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": {"uid": uid}}
 
 
-def window_valid(samples, observations):
-    samples = [x for x in samples if not x.get("warmup")]
+def measured(samples):
+    return [sample for sample in samples if not sample.get("warmup")]
+
+
+def relevant(observations, start, end):
+    """Observations that can attest to one sample.
+
+    One tolerance governs both "which observations are relevant" and "how large a hole is
+    acceptable"; a tighter filter than the tolerance would reject clean windows whenever a short
+    sample fits between two polls.
+    """
+    tolerance = COVERAGE_SECONDS * 1000
+    return [o for o in observations if start - tolerance <= o["at_ms"] <= end + tolerance]
+
+
+def coverage_ok(samples, observations):
+    """Strict evidence gate: API-healthy polls before and after every measured sample.
+
+    Foreign activity is deliberately NOT part of this gate; it is reported by
+    ``foreign_summary`` and never relaxes the coverage rule below.
+    """
+    samples = measured(samples)
     if not samples or not observations:
         return False
-    # One tolerance governs both "which observations are relevant" and "how large a hole is
-    # acceptable"; using a tighter filter than the tolerance rejects clean windows whenever a
-    # short sample fits between two polls.
     tolerance = COVERAGE_SECONDS * 1000
     for sample in samples:
         start, end = sample["started_ms"], sample["started_ms"] + sample["ms"]
-        relevant = [o for o in observations if start-tolerance <= o["at_ms"] <= end+tolerance]
-        if not relevant or any(not o["api_ok"] or o["foreign"] for o in relevant):
+        covering = relevant(observations, start, end)
+        if not covering or any(not o["api_ok"] for o in covering):
             return False
-        if not any(o["at_ms"] <= start for o in relevant):
+        if not any(o["at_ms"] <= start for o in covering):
             return False
-        if not any(o["at_ms"] >= end for o in relevant):
+        if not any(o["at_ms"] >= end for o in covering):
             return False
-        times = sorted(o["at_ms"] for o in relevant)
+        times = sorted(o["at_ms"] for o in covering)
         if max([times[0]-start, end-times[-1]]+[b-a for a,b in zip(times,times[1:])]) > tolerance:
             return False
     return True
+
+
+def foreign_summary(samples, observations):
+    """Foreign benchmark/unknown pods seen inside a measured sample's window.
+
+    Deduplicated per pod UID (falls back to app/name), ordered by first sighting and capped at
+    ``FOREIGN_SUMMARY_LIMIT``; ``total`` keeps the true count so truncation is never silent.
+    """
+    seen = {}
+    for sample in measured(samples):
+        start, end = sample["started_ms"], sample["started_ms"] + sample["ms"]
+        for observed in relevant(observations, start, end):
+            for pod in observed.get("foreign") or []:
+                key = pod.get("uid") or (pod.get("app"), pod.get("name"))
+                entry = seen.get(key)
+                if entry is None:
+                    seen[key] = {"app":pod.get("app"), "name":pod.get("name"), "role":pod.get("role"),
+                                 "node":pod.get("node"), "category":pod.get("category"),
+                                 "first_at_ms":observed["at_ms"], "last_at_ms":observed["at_ms"]}
+                else:
+                    entry["first_at_ms"] = min(entry["first_at_ms"], observed["at_ms"])
+                    entry["last_at_ms"] = max(entry["last_at_ms"], observed["at_ms"])
+    ordered = sorted(seen.values(), key=lambda item: item["first_at_ms"])
+    return {"observed": ordered[:FOREIGN_SUMMARY_LIMIT], "total": len(ordered)}
+
+
+def api_unhealthy(samples, observations):
+    """True when a poll covering a measured sample reported api_ok=false (not a coverage hole)."""
+    for sample in measured(samples):
+        start, end = sample["started_ms"], sample["started_ms"] + sample["ms"]
+        if any(not o["api_ok"] for o in relevant(observations, start, end)):
+            return True
+    return False
+
+
+def cell_window(samples, observations, state, done_marker_present, api_unknown=False):
+    """The single decision point for one cell.
+
+    usable             = SUCCEEDED and BASELINE_DONE and coverage_ok and not api_unknown
+    exclusive_window_  = usable and no foreign benchmark/unknown overlap (the old "clean" bit)
+    contamination      = api_failure / foreign_benchmark / None; a coverage hole alone is
+                         neither, it is simply not usable
+    """
+    foreign = foreign_summary(samples, observations)
+    coverage = coverage_ok(samples, observations)
+    api_failure = api_unknown or api_unhealthy(samples, observations)
+    usable = bool(state == "SUCCEEDED" and done_marker_present and coverage and not api_unknown)
+    clean = usable and not foreign["observed"]
+    return {"coverage_ok": coverage, "window_usable": usable,
+            "exclusive_window_valid": clean, "baseline_valid": clean,
+            "foreign_observed": foreign["observed"],
+            "foreign_observed_total": foreign["total"],
+            "contamination": ("api_failure" if api_failure
+                              else "foreign_benchmark" if foreign["observed"] else None)}
+
+
+def window_valid(samples, observations):
+    """Legacy meaning kept for reports/tests: strict coverage and no foreign overlap at all."""
+    return coverage_ok(samples, observations) and not foreign_summary(samples, observations)["observed"]
 
 
 def snapshot(ns, own_app=None, own_name=None):
@@ -167,13 +263,24 @@ def snapshot(ns, own_app=None, own_name=None):
 
 
 def wait_window(ns, seconds, evidence):
+    """Poll for a clean window; when it stays busy, record the exhaustion and continue.
+
+    Foreign jobs are only observed here: nothing is deleted, stopped, patched or rescheduled.
+    Every poll is appended to ``evidence`` so an exhausted wait still has proof.
+    """
     deadline=time.monotonic()+seconds
+    polls=0
     while True:
         observed=snapshot(ns)
+        polls+=1
         with evidence.open("a") as out:out.write(json.dumps(observed)+"\n")
         if observed["api_ok"] and not observed["foreign"]:
-            return
-        baseline.require(time.monotonic()<deadline, "exclusive window not ready or API unknown")
+            return {"exhausted":False,"polls":polls}
+        if time.monotonic()>=deadline:
+            marker={"at_ms":int(time.time()*1000),"api_ok":observed["api_ok"],
+                    "window_wait_exhausted":True,"foreign_count":len(observed["foreign"])}
+            with evidence.open("a") as out:out.write(json.dumps(marker)+"\n")
+            return {"exhausted":True,"polls":polls}
         threading.Event().wait(POLL_SECONDS)
 
 
@@ -202,8 +309,14 @@ def capture(name, operation, errors):
 
 def write_verdict(output, verdict, errors, secrets):
     verdict["evidence_errors"]=errors
-    if errors:verdict["baseline_valid"]=False
+    if errors:
+        # Unfaithful evidence can never be silently accepted, whatever the window looked like.
+        for key in ("window_usable","exclusive_window_valid","baseline_valid"):verdict[key]=False
     store(output,"verdict.json",verdict,secrets)
+
+
+def cell_name(verdict):
+    return "%s-k%d" % (verdict["kind"], verdict["k"])
 
 
 def platform_config():
@@ -217,14 +330,39 @@ def platform_config():
     endpoint=os.environ.get("AWS_ENDPOINT_URL",values.get("spark.hadoop.fs.s3a.endpoint"))
     baseline.require(key and secret and endpoint, "object store configuration missing")
     conf={"spark.sql.catalog.lance.storage.endpoint":endpoint,
-          "spark.sql.catalog.lance.storage.access_key_id":key,"spark.sql.catalog.lance.storage.secret_access_key":secret,
-          "spark.sql.catalog.lance.storage.region":"us-east-1","spark.sql.catalog.lance.storage.aws_allow_http":"true",
-          "spark.sql.catalog.lance.storage.virtual_hosted_style_request":"false"}
-    for scope in ("spark.kubernetes.driverEnv.","spark.executorEnv."):
-        for name,value in {"AWS_ACCESS_KEY_ID":key,"AWS_SECRET_ACCESS_KEY":secret,"AWS_ENDPOINT_URL":endpoint,
-                           "AWS_ENDPOINT":endpoint,"AWS_REGION":"us-east-1","AWS_ALLOW_HTTP":"true"}.items():
-            conf[scope+name]=value
+          "spark.sql.catalog.lance.storage.access_key_id":key,
+          "spark.sql.catalog.lance.storage.secret_access_key":secret}
+    conf.update(STORAGE_LITERALS)
+    roles={"key":key,"secret":secret,"endpoint":endpoint,"region":"us-east-1","allow_http":"true"}
+    for scope in STORAGE_ENV_SCOPES:
+        for name,role in STORAGE_ENV_ROLES.items():
+            conf[scope+name]=roles[role]
     return conf,(key,secret)
+
+
+def placeholder_storage():
+    """Exactly the platform_config keys with redacted values; dry-run only, never submits."""
+    conf={"spark.sql.catalog.lance.storage.endpoint":"<object-store endpoint>",
+          "spark.sql.catalog.lance.storage.access_key_id":"<redacted>",
+          "spark.sql.catalog.lance.storage.secret_access_key":"<redacted>"}
+    conf.update(STORAGE_LITERALS)
+    for scope in STORAGE_ENV_SCOPES:
+        for name in STORAGE_ENV_ROLES:
+            conf[scope+name]="<redacted>"
+    return conf
+
+
+def cell_command(c, kind, k, jar, remote_contract, remote_truth, remote, name, storage):
+    """Build the reviewed spark-submit invocation for one cell (pure: no cluster access)."""
+    conf=baseline.spark_conf(c);conf.update(schedule());conf.update(storage)
+    conf.update({"spark.kubernetes.driver.pod.name":name,"spark.kubernetes.driver.deleteOnTermination":"false",
+                 "spark.kubernetes.submission.waitAppCompletion":"false","spark.eventLog.dir":remote+"/spark-events",
+                 "spark.driver.maxResultSize":"1g"})
+    command=[os.environ.get("SPARK_HOME","/opt/spark")+"/bin/spark-submit","--master",c["cluster"]["master"],
+             "--deploy-mode","cluster","--name",name,"--class","BaselineBenchmark"]
+    for key,value in conf.items():command += ["--conf",key+"="+value]
+    command += [str(jar),remote_contract,c["query_part"],remote_truth,remote+"/samples.jsonl",kind,str(k)]
+    return conf,command
 
 
 def cancel_own(ns, name, uid, ledger, run_id, output, secrets):
@@ -235,25 +373,58 @@ def cancel_own(ns, name, uid, ledger, run_id, output, secrets):
         store(output,"cancel.json",{"code":p.returncode,"output":p.stdout+p.stderr},secrets)
 
 
-def run_cell(c, kind, k, jar, remote_contract, remote_truth, root, remote_root, storage, secrets, window_seconds):
+def prepare_matrix(c, contract_path, queries_path, truth_path, output, stopped_evidence=None):
+    """Validate frozen assets, fence the UID ledger, compile the JVM source, create the run root.
+
+    Returns the context ``run_one_cell`` needs. ``pair-run.py`` calls this once per (arm, round)
+    so every replicate keeps its own manifest, compiled jar and HDFS evidence root.
+    """
+    os.umask(0o077)
+    VERIFIED_STOPPED_DRIVERS.clear()
+    if stopped_evidence is not None:
+        VERIFIED_STOPPED_DRIVERS.update(load_stopped_evidence(stopped_evidence))
+    baseline.validate_contract(c);baseline.validate_asset_files(c,queries_path,truth_path)
+    baseline.require(baseline.query_float32_sha256([json.loads(l) for l in Path(queries_path).read_text().splitlines() if l.strip()])==c["query_float32_sha256"],"frozen queries changed")
+    output=Path(output).resolve();output.mkdir(parents=True,exist_ok=False)
+    runid="matrix-"+datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")+"-"+uuid.uuid4().hex[:8]
+    remote=c["cluster"]["evidence_root"]+"/"+runid
+    storage,secrets=platform_config();hdfs=os.environ.get("HADOOP_HOME","/opt/hadoop-3.3.1")+"/bin/hdfs"
+    store(output,"manifest.json",{"run_id":runid,"contract_sha256":baseline.sha256(contract_path),"truth_sha256":baseline.sha256(truth_path),
+                                 "query_json_sha256":baseline.sha256(queries_path),"schedule":schedule(),"executor_schedule":"default, all nodes observed",
+                                 "cells":baseline.cells(c),"remote":remote,"status":"STARTING",
+                                 "window_policy":"record overlapping foreign benchmark/unknown activity and keep the cell; only coverage/API/marker failures void a cell",
+                                 "verified_stopped_drivers":VERIFIED_STOPPED_DRIVERS},secrets)
+    src=Path(__file__).with_name("BaselineBenchmark.java");build=output/"build";build.mkdir();(build/"classes").mkdir()
+    image=c["image"]+"@"+c["image_digest"]
+    compiled=pilot.call(["docker","run","--rm","--user","0","--entrypoint","/bin/bash","-v",str(src)+":/src/BaselineBenchmark.java:ro",
+                         "-v",str(build)+":/run",image,"-lc",'set -e; "$JAVA_HOME/bin/javac" -cp "/opt/spark/jars/*" -d /run/classes /src/BaselineBenchmark.java; "$JAVA_HOME/bin/jar" cf /run/BaselineBenchmark.jar -C /run/classes .'],timeout=300)
+    store(build,"compile.log",compiled.stdout+compiled.stderr,secrets);baseline.require(compiled.returncode==0,"matrix source compile failed")
+    p=pilot.call([hdfs,"dfs","-mkdir","-p",remote],timeout=45);baseline.require(p.returncode==0,"HDFS evidence creation failed")
+    for local,name in [(contract_path,"contract.json"),(truth_path,"truth.json")]:
+        p=pilot.call([hdfs,"dfs","-put",str(local),remote+"/"+name],timeout=60);baseline.require(p.returncode==0,"create-only asset upload failed")
+    return {"contract":c,"output":output,"runid":runid,"remote":remote,"storage":storage,
+            "secrets":secrets,"hdfs":hdfs,"jar":build/"BaselineBenchmark.jar"}
+
+
+def run_one_cell(ctx, kind, k, window_seconds):
+    """Run one cell through the reviewed lifecycle; return (records, verdict).
+
+    A foreign benchmark in the window is recorded in the verdict and the cell stays usable; a
+    coverage/API/marker failure makes it unusable, which stops the matrix after evidence is kept.
+    """
+    c=ctx["contract"];root=ctx["output"];remote_root=ctx["remote"]
+    storage=ctx["storage"];secrets=ctx["secrets"];hdfs=ctx["hdfs"];jar=ctx["jar"]
     ns=c["cluster"]["namespace"]
     output=root/f"{kind}-k{k}";output.mkdir()
-    wait_window(ns,window_seconds,output/"window-before.jsonl")
+    window=wait_window(ns,window_seconds,output/"window-before.jsonl")
     name="b3255-"+kind+"-k"+str(k)+"-"+uuid.uuid4().hex[:12]
     pod,ok=pilot.get_pod(ns,name);baseline.require(ok and pod is None,"unique pod precondition failed")
-    conf=baseline.spark_conf(c);conf.update(schedule());conf.update(storage)
     remote=remote_root+f"/{kind}-k{k}"
-    conf.update({"spark.kubernetes.driver.pod.name":name,"spark.kubernetes.driver.deleteOnTermination":"false",
-                 "spark.kubernetes.submission.waitAppCompletion":"false","spark.eventLog.dir":remote+"/spark-events",
-                 "spark.driver.maxResultSize":"1g"})
+    conf,command=cell_command(c,kind,k,jar,remote_root+"/contract.json",remote_root+"/truth.json",
+                              remote,name,storage)
     store(output,"spark-conf.json",conf,secrets)
-    hdfs=os.environ.get("HADOOP_HOME","/opt/hadoop-3.3.1")+"/bin/hdfs"
     p=pilot.call([hdfs,"dfs","-mkdir","-p",remote+"/spark-events"],timeout=45)
     baseline.require(p.returncode==0,"cannot create event directory")
-    command=[os.environ.get("SPARK_HOME","/opt/spark")+"/bin/spark-submit","--master",c["cluster"]["master"],
-             "--deploy-mode","cluster","--name",name,"--class","BaselineBenchmark"]
-    for key,value in conf.items():command += ["--conf",key+"="+value]
-    command += [str(jar),remote_contract,c["query_part"],remote_truth,remote+"/samples.jsonl",kind,str(k)]
     state="PRE_SUBMIT";uid=None;app=None;observations=[];stop=threading.Event();monitor=None
     ledger=output/"created.json";start=time.monotonic();records=[];api_unknown=False
     deadline=start+c["timeouts"]["cell_seconds"]
@@ -312,20 +483,29 @@ def run_cell(c, kind, k, jar, remote_contract, remote_truth, root, remote_root, 
             records=[json.loads(line) for line in fetched.stdout.splitlines() if line.strip()]
         else: records=[]
         eventlog=any(p.is_file() for p in (output/"spark-events").rglob("*")) if (output/"spark-events").exists() else False
-        clean=window_valid(records,observations) and not api_unknown
-        verdict={"kind":kind,"k":k,"pod":name,"uid":uid,"app":app,"state":state,"exclusive_window_valid":clean,
-                 "eventlog_present":eventlog,"elapsed_seconds":time.monotonic()-start,
-                 "baseline_valid":False,"cache_residency":"unknown","cleanup":"own terminal pod retained as evidence"}
+        expected_marker='BASELINE_DONE {"ok":true,"kind":"'+kind+'","k":'+str(k)+'}'
+        marker_present=logs is not None and expected_marker in logs.stdout
+        window_state=cell_window(records,observations,state=state,done_marker_present=marker_present,
+                                 api_unknown=api_unknown)
+        verdict={"kind":kind,"k":k,"pod":name,"uid":uid,"app":app,"state":state,
+                 "done_marker_present":marker_present,"eventlog_present":eventlog,
+                 "elapsed_seconds":time.monotonic()-start,"cache_residency":"unknown",
+                 "window_wait_exhausted":window["exhausted"],
+                 "cleanup":"own terminal pod retained as evidence"}
+        verdict.update(window_state)
         try:
             validate_expected_cell(records,kind,k,eventlog)
-            expected_marker='BASELINE_DONE {"ok":true,"kind":"'+kind+'","k":'+str(k)+'}'
-            verdict["done_marker_present"] = logs is not None and expected_marker in logs.stdout
-            verdict["baseline_valid"]=state=="SUCCEEDED" and clean and verdict["done_marker_present"]
-        except (ValueError,KeyError) as exc:verdict["validation_error"]=str(exc)
-        if not clean:verdict["window_action"]="whole cell invalid; explicit new-attempt rerun required, never silently accepted"
+        except (ValueError,KeyError) as exc:
+            # Samples that fail validation are never acceptable, whatever the window looked like.
+            verdict["validation_error"]=str(exc)
+            for key in ("window_usable","exclusive_window_valid","baseline_valid"):verdict[key]=False
+        if not verdict["window_usable"]:
+            verdict["window_action"]="cell not usable; explicit new-attempt rerun required, never silently accepted"
+        elif not verdict["exclusive_window_valid"]:
+            verdict["window_action"]="foreign activity recorded as contamination; accepted, never clean"
         write_verdict(output,verdict,errors,secrets)
-    baseline.require(verdict["baseline_valid"],f"cell {kind} k{k} invalid; matrix stopped, preserve failure")
-    return records
+    baseline.require(verdict["window_usable"],f"cell {kind} k{k} not usable; matrix stopped, preserve failure")
+    return records,verdict
 
 
 def load_stopped_evidence(path):
@@ -342,36 +522,25 @@ def load_stopped_evidence(path):
 
 
 def run_matrix(c,contract_path,queries_path,truth_path,output,window_seconds=1800,stopped_evidence=None):
-    os.umask(0o077)
-    VERIFIED_STOPPED_DRIVERS.clear()
-    if stopped_evidence is not None:
-        VERIFIED_STOPPED_DRIVERS.update(load_stopped_evidence(stopped_evidence))
-    baseline.validate_contract(c);baseline.validate_asset_files(c,queries_path,truth_path)
-    baseline.require(baseline.query_float32_sha256([json.loads(l) for l in Path(queries_path).read_text().splitlines() if l.strip()])==c["query_float32_sha256"],"frozen queries changed")
-    output=Path(output).resolve();output.mkdir(parents=True,exist_ok=False)
-    runid="matrix-"+datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")+"-"+uuid.uuid4().hex[:8]
-    remote=c["cluster"]["evidence_root"]+"/"+runid
-    storage,secrets=platform_config();hdfs=os.environ.get("HADOOP_HOME","/opt/hadoop-3.3.1")+"/bin/hdfs"
-    store(output,"manifest.json",{"run_id":runid,"contract_sha256":baseline.sha256(contract_path),"truth_sha256":baseline.sha256(truth_path),
-                                 "query_json_sha256":baseline.sha256(queries_path),"schedule":schedule(),"executor_schedule":"default, all nodes observed",
-                                 "cells":baseline.cells(c),"remote":remote,"status":"STARTING",
-                                  "window_policy":"exclude active benchmark and unknown apps; record shared background",
-                                  "verified_stopped_drivers":VERIFIED_STOPPED_DRIVERS},secrets)
-    src=Path(__file__).with_name("BaselineBenchmark.java");build=output/"build";build.mkdir();(build/"classes").mkdir()
-    image=c["image"]+"@"+c["image_digest"]
-    compiled=pilot.call(["docker","run","--rm","--user","0","--entrypoint","/bin/bash","-v",str(src)+":/src/BaselineBenchmark.java:ro",
-                         "-v",str(build)+":/run",image,"-lc",'set -e; "$JAVA_HOME/bin/javac" -cp "/opt/spark/jars/*" -d /run/classes /src/BaselineBenchmark.java; "$JAVA_HOME/bin/jar" cf /run/BaselineBenchmark.jar -C /run/classes .'],timeout=300)
-    store(build,"compile.log",compiled.stdout+compiled.stderr,secrets);baseline.require(compiled.returncode==0,"matrix source compile failed")
-    p=pilot.call([hdfs,"dfs","-mkdir","-p",remote],timeout=45);baseline.require(p.returncode==0,"HDFS evidence creation failed")
-    for local,name in [(contract_path,"contract.json"),(truth_path,"truth.json")]:
-        p=pilot.call([hdfs,"dfs","-put",str(local),remote+"/"+name],timeout=60);baseline.require(p.returncode==0,"create-only asset upload failed")
-    all_records=[]
+    ctx=prepare_matrix(c,contract_path,queries_path,truth_path,output,stopped_evidence)
+    out=ctx["output"];secrets=ctx["secrets"];records=[];verdicts=[]
     try:
         for kind,k in baseline.cells(c):
-            all_records += run_cell(c,kind,k,build/"BaselineBenchmark.jar",remote+"/contract.json",remote+"/truth.json",
-                                    output,remote,storage,secrets,window_seconds)
-        baseline.validate_matrix(all_records,True)
-        store(output,"matrix-verdict.json",{"complete":True,"cells":5,"samples":96,"cache_residency":"unknown"},secrets)
+            cell_records,verdict=run_one_cell(ctx,kind,k,window_seconds)
+            records += cell_records;verdicts.append(verdict)
+        summary=baseline.validate_matrix(records,True)
+        usable=[verdict for verdict in verdicts if verdict.get("window_usable") is True]
+        clean=[verdict for verdict in verdicts if verdict.get("exclusive_window_valid") is True]
+        store(out,"matrix-verdict.json",{"complete":len(usable)==len(verdicts)==len(baseline.cells(c)),
+            "cells":len(baseline.cells(c)),"cells_usable":len(usable),"cells_clean":len(clean),
+            "contaminated_cells":[cell_name(v) for v in verdicts if v.get("contamination")],
+            "window_wait_exhausted_cells":[cell_name(v) for v in verdicts if v.get("window_wait_exhausted") is True],
+            "samples":summary["samples"],"cache_residency":"unknown"},secrets)
     except Exception as exc:
-        store(output,"matrix-verdict.json",{"complete":False,"failure_type":type(exc).__name__,"reason":str(exc),"accepted_samples":len(all_records)},secrets)
+        store(out,"matrix-verdict.json",{"complete":False,"failure_type":type(exc).__name__,
+            "reason":str(exc),"accepted_samples":len(records),"cells_completed":len(verdicts),
+            "cells_usable":sum(v.get("window_usable") is True for v in verdicts),
+            "cells_clean":sum(v.get("exclusive_window_valid") is True for v in verdicts),
+            "contaminated_cells":[cell_name(v) for v in verdicts if v.get("contamination")],
+            "window_wait_exhausted_cells":[cell_name(v) for v in verdicts if v.get("window_wait_exhausted") is True]},secrets)
         raise

@@ -391,3 +391,60 @@ class OutputTests(ReportCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowFieldTests(ReportCase):
+    """Old verdicts have no window fields; contaminated-but-usable cells keep their numbers."""
+
+    def contaminated_verdict(self, **overrides):
+        verdict = {"window_usable": True, "coverage_ok": True, "exclusive_window_valid": False,
+                   "baseline_valid": False, "contamination": "foreign_benchmark",
+                   "foreign_observed": [{"app": "app-text-bench", "name": "text-bench-iceberg-1",
+                                         "role": "executor", "node": "cpu-0149",
+                                         "category": "benchmark", "first_at_ms": 1,
+                                         "last_at_ms": 2}]}
+        verdict.update(overrides)
+        return verdict
+
+    def test_legacy_verdict_without_window_fields_is_tolerated_and_reported(self):
+        run = write_run(self.root, cells={("single", 10): single_cell(10)})
+        text = self.run_report("--run", "r=%s" % run)
+        self.assertIn("窗口有效 1/1 格", text)
+        self.assertIn("未记录窗口字段", text)
+        # The numbers of a legacy cell are still reported.
+        self.assertEqual(table_rows(text)[0],
+                         "| 向量单查询 | 10 | n/a（未指定对照组） | 204.5（307.6） | n/a |")
+
+    def test_contaminated_but_usable_cell_keeps_its_numbers_and_is_flagged(self):
+        run = write_run(self.root, cells={("single", 10): single_cell(10)},
+                        verdicts={("single", 10): self.contaminated_verdict()})
+        text = self.run_report("--run", "r=%s" % run)
+        self.assertEqual(table_rows(text)[0],
+                         "| 向量单查询 | 10 | n/a（未指定对照组） | 204.5（307.6） | n/a |")
+        self.assertIn("窗口可用 1/1 格（其中无外来污染 0 格、记录到外来污染但可用 1 格）", text)
+        self.assertIn("可用（有外来）", text)
+        self.assertIn("外来 benchmark 污染", text)
+
+    def test_window_usable_false_marks_the_cell_na_with_the_reason(self):
+        run = write_run(self.root, cells={("single", 10): single_cell(10)},
+                        verdicts={("single", 10): {"window_usable": False, "coverage_ok": True,
+                                                   "exclusive_window_valid": False,
+                                                   "baseline_valid": False,
+                                                   "contamination": "api_failure"}})
+        text = self.run_report("--run", "r=%s" % run)
+        row = table_rows(text)[0]
+        self.assertIn("n/a（verdict.window_usable=false", row)
+        self.assertIn("contamination=api_failure", row)
+        self.assertIn("窗口可用 0/1 格", text)
+
+    def test_coverage_hole_reason_never_claims_contamination(self):
+        run = write_run(self.root, cells={("single", 10): single_cell(10)},
+                        verdicts={("single", 10): {"window_usable": False, "coverage_ok": False,
+                                                   "exclusive_window_valid": False,
+                                                   "baseline_valid": False,
+                                                   "contamination": None}})
+        text = self.run_report("--run", "r=%s" % run)
+        row = table_rows(text)[0]
+        self.assertIn("n/a（verdict.window_usable=false", row)
+        self.assertIn("覆盖不足", row)
+        self.assertNotIn("contamination=foreign_benchmark", row)

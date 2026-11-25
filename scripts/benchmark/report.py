@@ -36,10 +36,15 @@ Statistics contract (do not change a number without changing this docstring):
   ``complete=false`` records, or ``verdict.baseline_valid=false`` (the runner
   itself rejected the cell). Numbers are never fabricated as 0.
 
-Window wording: only identifiable *newly appeared foreign* Spark pods close the
-window (``submit.activity()`` classes benchmark/unknown); long-lived background
-services are allowed. Cache wording: warm-session only; native index-cache
-residency stays unverified unless ``cache_evidence.residency_verified`` is true.
+Window wording (2026-11-25 policy): ``verdict.window_usable`` is the acceptance bit -- it
+requires polling evidence around every measured sample, ``api_ok`` throughout and the
+BASELINE_DONE marker. A foreign benchmark/unknown pod that overlaps a sample window is recorded
+in ``verdict.foreign_observed`` with ``contamination="foreign_benchmark"``; it clears
+``exclusive_window_valid`` but the cell keeps its numbers (the matrix no longer voids a cell for
+it). Long-lived background services are allowed as shared background. Old artifacts without the
+new fields are reported as ``未记录窗口字段`` and fall back to ``exclusive_window_valid`` for
+``baseline_valid``. Cache wording: warm-session only; native index-cache residency stays
+unverified unless ``cache_evidence.residency_verified`` is true.
 """
 
 import argparse
@@ -183,9 +188,27 @@ def empty_cell(kind, k, directory):
     }
 
 
+def contamination_text(verdict):
+    """Explain why ``window_usable`` is false without inventing evidence."""
+    contamination = verdict.get("contamination")
+    if contamination == "api_failure":
+        return "contamination=api_failure（轮询 API 失败或 API 不可用）"
+    if contamination == "foreign_benchmark":
+        return "contamination=foreign_benchmark（样本窗口内有外来 benchmark）"
+    if verdict.get("coverage_ok") is False:
+        return "覆盖不足（样本前后缺观测、空洞超限或 api_ok=false），contamination=null"
+    if verdict.get("state") and verdict["state"] != "SUCCEEDED":
+        return "state=%s" % verdict["state"]
+    if verdict.get("done_marker_present") is False:
+        return "缺 BASELINE_DONE 标记"
+    return "见 verdict.json"
+
+
 def verdict_reason(verdict):
     if verdict.get("validation_error"):
         return str(verdict["validation_error"])
+    if "window_usable" in verdict and verdict.get("window_usable") is not True:
+        return "window_usable=false：" + contamination_text(verdict)
     if verdict.get("exclusive_window_valid") is False:
         return "exclusive_window_valid=false，窗口内有外来 pod 或 API 不可用"
     if verdict.get("state") and verdict["state"] != "SUCCEEDED":
@@ -193,6 +216,23 @@ def verdict_reason(verdict):
     if verdict.get("done_marker_present") is False:
         return "缺 BASELINE_DONE 标记"
     return "见 verdict.json"
+
+
+def window_recorded(verdict):
+    return "window_usable" in (verdict or {})
+
+
+def window_cell_text(verdict):
+    """Window column of the completeness table; legacy verdicts keep their true/false text."""
+    if not verdict:
+        return "n/a（无 verdict）"
+    if not window_recorded(verdict):
+        return "true" if verdict.get("exclusive_window_valid") is True else "false"
+    if verdict.get("window_usable") is not True:
+        return "不可用"
+    if verdict.get("exclusive_window_valid") is True:
+        return "可用（干净）"
+    return "可用（有外来）"
 
 
 def activity_summary(directory):
@@ -378,7 +418,11 @@ def compute_cell(kind, k, directory, run_name, contract, skip_missing, outlier_f
         cell["problems"].append("repeat 不足 3 个的 identity：%s" % "、".join(incomplete))
     cell["complete"] = bool(measured) and not cell["failed"] and not incomplete
 
-    if verdict.get("baseline_valid") is False:
+    if window_recorded(verdict):
+        # A contaminated cell is usable: window_usable decides, not baseline_valid/cleanliness.
+        if verdict.get("window_usable") is not True:
+            cell["unavailable"] = "verdict.window_usable=false：" + verdict_reason(verdict)
+    elif verdict.get("baseline_valid") is False:
         cell["unavailable"] = "verdict.baseline_valid=false：" + verdict_reason(verdict)
 
     checked, mismatch = sql_evidence(measured, contract)
@@ -797,21 +841,53 @@ def render_resources(control, treatment):
 
 def render_window(control, treatment):
     lines = ["## 窗口口径", "",
-             "- 只排除「可识别的、新增的外来 Spark pod」（submit.activity() 归为 benchmark/unknown "
-             "的活 driver/executor）；Kyuubi/ThriftServer/Spark Connect 等常驻 background 允许作为共享背景，"
-             "但每格必须在样本前后都有轮询证据。",
-             "- 判定依据：每格 verdict.exclusive_window_valid，以及 activity.jsonl 的轮询记录。"]
+             "- 只记录、不作废：与样本窗口重叠的外来 benchmark/unknown pod 写入 "
+             "verdict.foreign_observed 并标 contamination=foreign_benchmark，该格只要 "
+             "window_usable=true 就照常计入数字；矩阵不再因污染中止，也从不停止或删除外来作业。",
+             "- 仍然严格：每格必须在样本前后都有轮询证据、无超限空洞、api_ok 全真，并且有 "
+             "BASELINE_DONE 标记；覆盖/API/标记任一缺失即 window_usable=false（该格 n/a，矩阵停）。",
+             "- Kyuubi/ThriftServer/Spark Connect 等常驻 background 允许作为共享背景。",
+             "- 判定依据：verdict.window_usable、verdict.exclusive_window_valid、"
+             "activity.jsonl 与 window-before.jsonl 的轮询记录。"]
     for run, role in ((control, "对照组"), (treatment, "本方")):
         if not run:
             continue
         totals = activity_totals(run)
         with_verdict = [cell for cell in run["cells"].values() if cell.get("verdict")]
-        valid = sum(1 for cell in with_verdict
-                    if cell["verdict"].get("exclusive_window_valid") is True)
-        lines.append("- %s `%s`：窗口有效 %d/%d 格（有 verdict 的格）；activity 轮询 %d 次，"
-                     "API 失败 %d 次，含外来 pod 的轮询 %d 次（其中 unknown %d 次）。" % (
-                         role, run["name"], valid, len(with_verdict), totals["polls"],
-                         totals["api_fail"], totals["foreign_polls"], totals["unknown_polls"]))
+        legacy = [cell for cell in with_verdict if not window_recorded(cell["verdict"])]
+        modern = [cell for cell in with_verdict if window_recorded(cell["verdict"])]
+        activity_text = ("activity 轮询 %d 次，API 失败 %d 次，含外来 pod 的轮询 %d 次（其中 unknown %d 次）"
+                         % (totals["polls"], totals["api_fail"], totals["foreign_polls"],
+                            totals["unknown_polls"]))
+        if legacy:
+            valid = sum(1 for cell in legacy if cell["verdict"].get("exclusive_window_valid") is True)
+            lines.append("- %s `%s`：窗口有效 %d/%d 格（旧产物格）；%s。" % (
+                role, run["name"], valid, len(legacy), activity_text))
+            lines.append("- %s `%s`：%d/%d 格为旧产物，未记录窗口字段"
+                         "（window_usable/foreign_observed），只能按 exclusive_window_valid 解读。" % (
+                             role, run["name"], len(legacy), len(with_verdict)))
+        if modern:
+            usable = sum(1 for cell in modern if cell["verdict"].get("window_usable") is True)
+            clean = sum(1 for cell in modern if cell["verdict"].get("exclusive_window_valid") is True)
+            contaminated = sum(1 for cell in modern
+                               if cell["verdict"].get("contamination") == "foreign_benchmark")
+            lines.append("- %s `%s`：窗口可用 %d/%d 格（其中无外来污染 %d 格、"
+                         "记录到外来污染但可用 %d 格）；%s。" % (
+                             role, run["name"], usable, len(modern), clean, contaminated,
+                             activity_text))
+            observed = {}
+            for cell in modern:
+                for item in cell["verdict"].get("foreign_observed") or []:
+                    key = item.get("app") or item.get("name")
+                    observed.setdefault(key, (item.get("category"), item.get("first_at_ms"),
+                                              item.get("last_at_ms")))
+            if observed:
+                lines.append("  - 外来观测摘要：%s。" % "、".join(
+                    "%s（%s，%s–%s ms）" % (name, category, first, last)
+                    for name, (category, first, last) in sorted(observed.items())))
+            exhausted = [cell for cell in modern if cell["verdict"].get("window_wait_exhausted") is True]
+            if exhausted:
+                lines.append("  - 等空窗耗尽（window_wait_exhausted=true）：%d 格，仍按 window_usable 判定。" % len(exhausted))
     return lines
 
 
@@ -868,7 +944,7 @@ def render_outliers(control, treatment, rows, outlier_factor):
 
 def render_completeness(control, treatment, rows):
     lines = ["## 样本完整性与召回", "",
-             "| 场景 | k | 运行 | measured | warmup | complete=false | recall_min | 窗口有效 | 说明 |",
+             "| 场景 | k | 运行 | measured | warmup | complete=false | recall_min | 窗口（可用/干净） | 说明 |",
              "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for kind, k in rows:
         for run, role in ((control, "对照组"), (treatment, "本方")):
@@ -888,11 +964,7 @@ def render_completeness(control, treatment, rows):
                 recall = "%.2f" % cell["recall_min"]
                 if cell["recall_missing"]:
                     recall += "*"
-            verdict = cell.get("verdict") or {}
-            if "exclusive_window_valid" not in verdict:
-                window = "n/a（无 verdict）"
-            else:
-                window = "true" if verdict.get("exclusive_window_valid") is True else "false"
+            window = window_cell_text(cell.get("verdict") or {})
             if cell["problems"]:
                 note = "；".join(cell["problems"])
             elif cell["unavailable"]:
@@ -921,6 +993,12 @@ def render_gaps(control, treatment, rows):
         expected = contract_cells(run)
         if not expected:
             continue
+        stale = [identity for identity, cell in sorted(run["cells"].items())
+                 if cell.get("verdict") and not window_recorded(cell["verdict"])]
+        if stale:
+            gaps.append("- %s / %s：%d 格为旧产物，未记录窗口字段（window_usable/foreign_observed），"
+                        "窗口口径只能按 exclusive_window_valid 解读" % (
+                            role, run["name"], len(stale)))
         missing = [identity for identity in expected if identity not in run["cells"]]
         if missing:
             gaps.append("- %s / %s：合同要求 %d 格，产物只有 %d 格；缺 %s（矩阵未跑完或未产出，"
@@ -938,6 +1016,13 @@ def render_gaps(control, treatment, rows):
                 continue
             if cell["unavailable"]:
                 gaps.append("- %s：n/a，原因：%s" % (label, cell["unavailable"]))
+            contamination = (cell.get("verdict") or {}).get("contamination")
+            if contamination == "foreign_benchmark" and not cell["unavailable"]:
+                gaps.append("- %s：记录到外来 benchmark 污染（与样本窗口重叠），该格仍按 "
+                            "window_usable 计入；这是受污染数字，不是干净窗口数字" % label)
+            elif contamination == "api_failure" and not cell["unavailable"]:
+                gaps.append("- %s：轮询 API 失败但 window_usable=true（样本窗口内未命中失败轮询），"
+                            "只能作为可用数字解读" % label)
             for problem in cell["problems"]:
                 if problem == cell["unavailable"]:
                     continue

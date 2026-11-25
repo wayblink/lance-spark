@@ -741,14 +741,13 @@ class FeatureRunPlanTests(unittest.TestCase):
         self.assertIn("sha256 mismatch", str(caught.exception))
 
     def test_sha256sum_parser_ignores_ssh_noise(self):
-        text = ("e59d8ac86cf4cdd9b7bd9490679cfe98cc2c69ba333883a0e8d9785813fe1e09"
-                "  /home/u/runs/t/submit.py\n"
+        # Derive the fixture from the pin so a runner change cannot leave a stale literal here.
+        pinned = feature_common.RUNNER_SHA256["submit.py"]
+        text = (pinned + "  /home/u/runs/t/submit.py\n"
                 "Warning: remote port forwarding failed\n")
         parsed = feature_run.parse_sha256sum(text)
-        self.assertEqual(parsed["submit.py"],
-                         "e59d8ac86cf4cdd9b7bd9490679cfe98cc2c69ba333883a0e8d9785813fe1e09")
-        feature_run.verify_sha_output(text, {"submit.py": feature_common.RUNNER_SHA256["submit.py"]},
-                                      "test")
+        self.assertEqual(parsed["submit.py"], pinned)
+        feature_run.verify_sha_output(text, {"submit.py": pinned}, "test")
         with self.assertRaises(ValueError):
             feature_run.verify_sha_output(text, {"submit.py": "1" * 64}, "test")
         with self.assertRaises(ValueError):

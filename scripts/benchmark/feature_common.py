@@ -33,9 +33,11 @@ BASELINE_SHA256 = "a29c97557f178e877ff9c9d29c42dfd186e13ffce3fde250ef427520342a1
 
 # The runner files that actually submit and validate cells. They may only be synced to the
 # remote host when their bytes match the reviewed version (the one that produced C5/b102cc7
-# behaviour plus the single-tolerance window fix). Anything else is refused before ssh.
+# behaviour plus the single-tolerance window fix and the 2026-11-25 window policy: foreign
+# benchmark activity is recorded, coverage/API/marker failures still void a cell). Anything else
+# is refused before ssh.
 RUNNER_SHA256 = {
-    "submit.py": "e59d8ac86cf4cdd9b7bd9490679cfe98cc2c69ba333883a0e8d9785813fe1e09",
+    "submit.py": "48243a451efc1411bd3aeffee33092c3e257481ad22bd1274dbc53f829314399",
     "baseline.py": "3ac5a95659db6746afd27a3585dff4c1de8a1d4caf9bc0c13424587245a7b363",
     "pilot.py": "1e9f57b422cf98b98b62c87eb9c28d42b5f1c3931b5a026267389c4cedc1c9d7",
     "benchmark.py": "0d199446575427f37e2977f858066286792151830c34745eb307ab7e1a4fd77c",

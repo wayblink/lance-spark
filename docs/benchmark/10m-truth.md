@@ -50,3 +50,17 @@ python3 scripts/benchmark/truth.py assemble --contract scripts/benchmark/baselin
 ## 本轮验证状态
 
 离线Python测试先因缺truth.py失败，再7/7绿（4workers）；覆盖top-k集中一片、同距、重复docid、boundedmerge、hash、缺coverage/缺query/错块checksum。Java实际TopK/Block另有5项并发检查：集中赢家、同距、随机有界合并对全sort、coverage拒重与序列化。Java工具只本地JDK17编译通过，没有本轮提交Spark，也没有生成正式100×2000真值。两fragment/三query的A4 pilot只证明小N路径，不能替代完整586fragment验证。
+
+## 正式 B 执行证据
+
+2026-11-25 B已获用户批准并由root授权执行。run `b3271-truth-20261125043442-d5358f`、driver UID `6c065647-f113-43c7-ae8d-d69221fc5432`，固定镜像digest `374dddc63fc0de9b52bb604135594a38298c920be2950e9f1c87be72eb2ee0fb`，完整hostname `cpu-1122.host.platform.shaipower.com`；只读健康检查Ready=True、taints为空、Disk/Memory/PIDPressure=False。资源12×4c/30g+12g、driver4c/12g，native cache6GiB+1GiB。生成与下载拼装总墙钟407.148秒；这是资产准备，不是ANN基准成绩。
+
+实际执行Java源固定为提交 `f825711`，SHA256 `03cc81c10be92635edb4652299cf687cbaa361180cf955e3a4c73bb6aa11a2ab`；实际launch脚本当时SHA256 `83848756148de5c465fa4905b1ec3b34adfe3c7811d5d184311995fa2697ba72`，通过CLI显式传完整节点名。后续提交的 `truth_submit.py` 增加默认完整节点名、启动umask077、压力/taint门禁、pod证据字段脱敏、只watch非敏感列，以及采证失败仍写verdict；没有热改运行Java。已运行目录随后chmod700，敏感证据600并脱敏，不声称旧launch已包含后续所有加固。
+
+10块全部完成，每块coverage586；全100query×top2000=200,000rowid实体，原parquet hash、canonicalfloat32 hash、每query唯一rowid及distance/rowid顺序通过 `baseline.validate_assets`。shai本地资产：
+
+- `/home/wanganyang/runs/3271-truth-b1/truth.json`：11,770,072B，SHA256 `66465c296d4771c3c7bcf5e191914f33dd8708229e9fc96d2f40ed0034fe7c02`。
+- `/home/wanganyang/runs/3271-truth-b1/queries-f32.jsonl`：文件SHA256 `9e90bc2fdb3b3d5796e718f1d8f5aae156e472fea13eea2668e48e45f6178551`，canonicalfloat32仍为上述 `e60ccd2f…`。
+- `/home/wanganyang/runs/3271-truth-b1/truth/run-manifest.json`：SHA256 `a2e8b9f7c744bb3f93e1935ce5232d1c068c9d0925dd3a019b4bf79ae760dc34`；最终验证记录 `validated-assets.json`。
+
+HDFS原块与eventlog保留于 `/user/wanganyang/sparkann/bench/lance-dev-3255/b3271-truth-20261125043442-d5358f/`；无表/索引改动。B与post-validation两后台job均已collect退出；本agent没有启动C。

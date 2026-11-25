@@ -15,6 +15,7 @@ package org.lance.spark.read;
 
 import org.lance.spark.utils.Optional;
 
+import org.apache.spark.sql.connector.expressions.FieldReference;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.junit.jupiter.api.Test;
 
@@ -47,7 +48,8 @@ public class FilterPushDownTest {
         };
     Optional<String> whereClause2 = FilterPushDown.compileFiltersToSqlWhereClause(filters2);
     assertTrue(whereClause2.isPresent());
-    assertEquals("(age > 30) AND (salary < 50000)", whereClause2.get());
+    assertEquals(
+        "(age > 30) AND (name LIKE '%John%' ESCAPE '\\') AND (salary < 50000)", whereClause2.get());
 
     // Test case 3: Empty filters array
     Predicate[] filters3 = new Predicate[] {};
@@ -64,7 +66,9 @@ public class FilterPushDownTest {
         };
     Optional<String> whereClause4 = FilterPushDown.compileFiltersToSqlWhereClause(filters4);
     assertTrue(whereClause4.isPresent());
-    assertEquals("(age > 30) AND (address IS NULL) AND (country == 'USA')", whereClause4.get());
+    assertEquals(
+        "(age > 30) AND (name LIKE '%John%' ESCAPE '\\') AND (address IS NULL) AND (country == 'USA')",
+        whereClause4.get());
 
     // Test case 5: Not, Or, And combinations
     Predicate[] filters5 =
@@ -325,6 +329,148 @@ public class FilterPushDownTest {
 
     Predicate intGt = TestPredicates.gt("age", 30);
     assertTrue(FilterPushDown.isPredicateSupported(intGt));
+  }
+
+  @Test
+  public void testStringPredicatesRenderAsEscapedLike() {
+    // % and _ in the needle must match literally, and the escape character itself must be escaped.
+    Predicate starts = TestPredicates.startsWith("name", "a%b_c\\d");
+    assertTrue(FilterPushDown.isPredicateSupported(starts));
+    assertEquals(
+        "(name LIKE 'a\\%b\\_c\\\\d%' ESCAPE '\\')",
+        FilterPushDown.compileFiltersToSqlWhereClause(new Predicate[] {starts}).get());
+
+    Predicate ends = TestPredicates.endsWith("name", "x_y");
+    assertTrue(FilterPushDown.isPredicateSupported(ends));
+    assertEquals(
+        "(name LIKE '%x\\_y' ESCAPE '\\')",
+        FilterPushDown.compileFiltersToSqlWhereClause(new Predicate[] {ends}).get());
+
+    Predicate contains = TestPredicates.contains("name", "50%");
+    assertTrue(FilterPushDown.isPredicateSupported(contains));
+    assertEquals(
+        "(name LIKE '%50\\%%' ESCAPE '\\')",
+        FilterPushDown.compileFiltersToSqlWhereClause(new Predicate[] {contains}).get());
+
+    // A single quote in the needle is an SQL literal escape (doubled), not a LIKE escape.
+    assertEquals(
+        "(name LIKE '%O''B%' ESCAPE '\\')",
+        FilterPushDown.compileFiltersToSqlWhereClause(
+                new Predicate[] {TestPredicates.contains("name", "O'B")})
+            .get());
+
+    // An empty needle is a valid "matches every non-null value" pattern.
+    assertEquals(
+        "(name LIKE '%%' ESCAPE '\\')",
+        FilterPushDown.compileFiltersToSqlWhereClause(
+                new Predicate[] {TestPredicates.contains("name", "")})
+            .get());
+  }
+
+  @Test
+  public void testBareLikePatternPassesThroughWithoutBackslash() {
+    Predicate like = TestPredicates.like("name", "a%b_c");
+    assertTrue(FilterPushDown.isPredicateSupported(like));
+    assertEquals(
+        "(name LIKE 'a%b_c')",
+        FilterPushDown.compileFiltersToSqlWhereClause(new Predicate[] {like}).get());
+
+    // A backslash escape in the pattern is rejected: the V2 LIKE predicate carries no escape
+    // character, so interpreting Spark's backslash sequences here would not be provably
+    // equivalent.
+    assertFalse(FilterPushDown.isPredicateSupported(TestPredicates.like("name", "a\\%b")));
+  }
+
+  @Test
+  public void testNotEqualPredicate() {
+    Predicate neq = TestPredicates.neq("id", 3);
+    assertTrue(FilterPushDown.isPredicateSupported(neq));
+    assertEquals(
+        "(id != 3)", FilterPushDown.compileFiltersToSqlWhereClause(new Predicate[] {neq}).get());
+  }
+
+  @Test
+  public void testStringFunctionsRenderWithSparkSemantics() {
+    Predicate lowerEq =
+        TestPredicates.eqExpr(TestPredicates.lower("name"), TestPredicates.literalOf("abc"));
+    assertTrue(FilterPushDown.isPredicateSupported(lowerEq));
+    assertEquals(
+        "(lower(name) == 'abc')",
+        FilterPushDown.compileFiltersToSqlWhereClause(new Predicate[] {lowerEq}).get());
+
+    Predicate upperEq =
+        TestPredicates.eqExpr(TestPredicates.upper("name"), TestPredicates.literalOf("ABC"));
+    assertEquals(
+        "(upper(name) == 'ABC')",
+        FilterPushDown.compileFiltersToSqlWhereClause(new Predicate[] {upperEq}).get());
+
+    Predicate lenEq =
+        TestPredicates.eqExpr(TestPredicates.charLength("name"), TestPredicates.literalOf(3));
+    assertTrue(FilterPushDown.isPredicateSupported(lenEq));
+    assertEquals(
+        "(char_length(name) == 3)",
+        FilterPushDown.compileFiltersToSqlWhereClause(new Predicate[] {lenEq}).get());
+  }
+
+  @Test
+  public void testArithmeticPredicatesRender() {
+    Predicate modEq =
+        TestPredicates.eqExpr(
+            TestPredicates.mod(FieldReference.column("id"), TestPredicates.literalOf(2)),
+            TestPredicates.literalOf(1));
+    assertTrue(FilterPushDown.isPredicateSupported(modEq));
+    assertEquals(
+        "((id % 2) == 1)",
+        FilterPushDown.compileFiltersToSqlWhereClause(new Predicate[] {modEq}).get());
+
+    Predicate addGt =
+        TestPredicates.gtExpr(
+            TestPredicates.scalar(
+                "+",
+                TestPredicates.mod(FieldReference.column("id"), TestPredicates.literalOf(2)),
+                TestPredicates.literalOf(3)),
+            TestPredicates.literalOf(4));
+    assertTrue(FilterPushDown.isPredicateSupported(addGt));
+    assertEquals(
+        "(((id % 2) + 3) > 4)",
+        FilterPushDown.compileFiltersToSqlWhereClause(new Predicate[] {addGt}).get());
+  }
+
+  @Test
+  public void testUnsafeShapesStayResidual() {
+    // Division is not equivalent: Spark returns a double for integral operands, DataFusion keeps
+    // integral division.
+    Predicate divide =
+        TestPredicates.eqExpr(
+            TestPredicates.scalar("/", FieldReference.column("id"), TestPredicates.literalOf(2)),
+            TestPredicates.literalOf(1));
+    assertFalse(FilterPushDown.isPredicateSupported(divide));
+
+    // Unknown functions are not translated.
+    Predicate substring =
+        TestPredicates.eqExpr(
+            TestPredicates.scalar("SUBSTRING", FieldReference.column("id")),
+            TestPredicates.literalOf("1"));
+    assertFalse(FilterPushDown.isPredicateSupported(substring));
+
+    // A non-literal right side stays residual: the SQL renderer only guarantees literal operands.
+    Predicate columnToColumn =
+        new Predicate(
+            "=",
+            new org.apache.spark.sql.connector.expressions.Expression[] {
+              FieldReference.column("id"), FieldReference.column("name")
+            });
+    assertFalse(FilterPushDown.isPredicateSupported(columnToColumn));
+
+    // AND/OR with one unsupported side must not silently drop that side from the pushed SQL.
+    Predicate mixedAnd =
+        TestPredicates.and(
+            TestPredicates.gt("age", 30),
+            TestPredicates.eqExpr(
+                TestPredicates.scalar(
+                    "/", FieldReference.column("id"), TestPredicates.literalOf(2)),
+                TestPredicates.literalOf(1)));
+    assertFalse(FilterPushDown.isPredicateSupported(mixedAnd));
   }
 
   @Test

@@ -15,6 +15,7 @@ package org.lance.spark.read;
 
 import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.expressions.FieldReference;
+import org.apache.spark.sql.connector.expressions.GeneralScalarExpression;
 import org.apache.spark.sql.connector.expressions.LiteralValue;
 import org.apache.spark.sql.connector.expressions.filter.And;
 import org.apache.spark.sql.connector.expressions.filter.Not;
@@ -96,6 +97,62 @@ final class TestPredicates {
   static Predicate contains(String column, String value) {
     return new Predicate(
         "CONTAINS", new Expression[] {FieldReference.column(column), literalOf(value)});
+  }
+
+  static Predicate startsWith(String column, String value) {
+    return new Predicate(
+        "STARTS_WITH", new Expression[] {FieldReference.column(column), literalOf(value)});
+  }
+
+  static Predicate endsWith(String column, String value) {
+    return new Predicate(
+        "ENDS_WITH", new Expression[] {FieldReference.column(column), literalOf(value)});
+  }
+
+  static Predicate like(String column, String pattern) {
+    return new Predicate(
+        "LIKE", new Expression[] {FieldReference.column(column), literalOf(pattern)});
+  }
+
+  static Predicate neq(String column, Object value) {
+    return new Predicate("<>", new Expression[] {FieldReference.column(column), literalOf(value)});
+  }
+
+  /** A binary scalar expression with the exact shape Spark's V2 builder produces. */
+  static GeneralScalarExpression scalar(String name, Expression... children) {
+    return new GeneralScalarExpression(name, children);
+  }
+
+  static GeneralScalarExpression lower(String column) {
+    return scalar("LOWER", FieldReference.column(column));
+  }
+
+  static GeneralScalarExpression upper(String column) {
+    return scalar("UPPER", FieldReference.column(column));
+  }
+
+  static GeneralScalarExpression charLength(String column) {
+    return scalar("CHAR_LENGTH", FieldReference.column(column));
+  }
+
+  static GeneralScalarExpression mod(Expression left, Expression right) {
+    return scalar("%", left, right);
+  }
+
+  /**
+   * A predicate that must stay residual: division is not on the strict-equivalence whitelist
+   * because Spark returns a double for integral operands while the plan keeps integral division.
+   */
+  static Predicate divideGt(String column, Object divisor, Object bound) {
+    return gtExpr(scalar("/", FieldReference.column(column), literalOf(divisor)), literalOf(bound));
+  }
+
+  static Predicate eqExpr(Expression left, Expression right) {
+    return new Predicate("=", new Expression[] {left, right});
+  }
+
+  static Predicate gtExpr(Expression left, Expression right) {
+    return new Predicate(">", new Expression[] {left, right});
   }
 
   static Predicate and(Predicate left, Predicate right) {

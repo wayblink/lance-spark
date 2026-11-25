@@ -367,6 +367,44 @@ These options control how data is read from Lance datasets. They can be set usin
 | `runtime_filter_max_bytes` | Integer | `4194304` | Maximum estimated size in bytes of accumulated Spark runtime filters. Oversized filters are ignored.           |
 | `topN_push_down`      | Boolean | `true`  | Whether to push down TopN (ORDER BY ... LIMIT) operations to Lance for optimized sorting.                         |
 
+### Filter Expressions Pushed to Lance
+
+With `pushDownFilters=true` (the default), predicates on dataset columns are translated to a Lance
+SQL filter and evaluated by the Lance reader. These shapes are pushed down:
+
+| Shape | Pushed as |
+|---|---|
+| `AND`, `OR`, `NOT` | the same boolean combination |
+| `=`, `<>`, `<`, `<=`, `>`, `>=` | comparison against literal values |
+| `IS NULL`, `IS NOT NULL` | `IS [NOT] NULL` |
+| `IN (...)` | `IN` list of literals |
+| `startsWith`, `endsWith`, `contains` | anchored `LIKE` with `%`/`_` escaped |
+| `lower`, `upper`, `length` | `lower`, `upper`, `char_length` |
+| `+`, `-`, `*`, `%` | arithmetic (Spark only offers these in ANSI mode) |
+| `LIKE` with a literal pattern | passed through verbatim |
+
+Predicates outside this list stay in Spark and are evaluated after the scan, so results are
+unchanged; only the amount of data Lance has to rank, decode or return changes. `_score` is never
+pushed down, which keeps the global `ORDER BY _score DESC LIMIT k` correct when a residual predicate
+exists. Division (`/`) is deliberately not pushed: Spark returns a double for integral operands
+while the Lance plan keeps integral division.
+
+Arithmetic predicates deserve one caution: pushdown only happens with `spark.sql.ansi.enabled=true`
+(non-ANSI Spark hands them to the connector as non-predicate expressions) and integer overflow
+behaviour is not exercised by the equivalence tests, so a filter that overflows an integral type
+may behave differently between Spark and the plan.
+
+```sql
+-- Pushed: startsWith is rewritten to LIKE 'abc%' ESCAPE '\'
+SELECT id FROM docs WHERE startsWith(title, 'abc');
+
+-- Pushed: lower() is translated, so only matching rows cross from Lance to Spark
+SELECT id FROM docs WHERE lower(author) = 'ada';
+
+-- Stays in Spark: division is not on the strict-equivalence list
+SELECT id FROM docs WHERE price / 2 > 10;
+```
+
 ### Runtime Join Filtering
 
 On Spark 4.1 and newer, Spark can push join dynamic partition pruning filters into Lance scans. Lance accepts `IN` filters on projected `_rowaddr` and `_rowid` columns, active sharding columns, and top-level scalar columns backed by a compatible scalar or zonemap index. Columns that Spark reads with lossy conversions are skipped (`Timestamp(NANOSECOND)`, `Date(MILLISECOND)`, and `UInt64`).

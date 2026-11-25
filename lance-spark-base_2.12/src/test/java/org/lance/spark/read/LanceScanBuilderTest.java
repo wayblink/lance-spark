@@ -232,11 +232,11 @@ public class LanceScanBuilderTest {
   @Test
   public void testPushPredicatesMixedSupportedAndUnsupported() {
     LanceScanBuilder builder = createBuilder();
-    // CONTAINS is not supported for push-down
-    Predicate[] predicates = {TestPredicates.gt("x", 1L), TestPredicates.contains("b", "test")};
+    // Division is not on the strict-equivalence whitelist, so it stays in Spark.
+    Predicate[] predicates = {TestPredicates.gt("x", 1L), TestPredicates.divideGt("b", 2, 1)};
     Predicate[] postScan = builder.pushPredicates(predicates);
     assertEquals(1, postScan.length);
-    assertEquals("CONTAINS", postScan[0].name());
+    assertEquals(">", postScan[0].name());
     assertEquals(1, builder.pushedPredicates().length);
     assertEquals(">", builder.pushedPredicates()[0].name());
   }
@@ -383,9 +383,9 @@ public class LanceScanBuilderTest {
   @Test
   public void testResidualPredicateBlocksLimitPushdownWithoutBlobColumn() {
     LanceScanBuilder builder = createBuilder();
-    // Unsupported CONTAINS stays in Spark even on a table with no blob columns.
+    // Unsupported division stays in Spark even on a table with no blob columns.
     Predicate[] postScan =
-        builder.pushPredicates(new Predicate[] {TestPredicates.contains("b", "x")});
+        builder.pushPredicates(new Predicate[] {TestPredicates.divideGt("b", 2, 1)});
     assertEquals(1, postScan.length);
     assertFalse(builder.pushLimit(10));
   }
@@ -647,7 +647,7 @@ public class LanceScanBuilderTest {
   @Test
   public void testPushAggregationRejectsCountColumnWithResidualFilters() {
     LanceScanBuilder builder = createBuilder();
-    builder.pushPredicates(new Predicate[] {TestPredicates.contains("b", "test")});
+    builder.pushPredicates(new Predicate[] {TestPredicates.divideGt("b", 2, 1)});
     assertFalse(
         builder.pushAggregation(
             new Aggregation(

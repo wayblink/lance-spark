@@ -464,3 +464,21 @@ curl -sSL -o /tmp/lance-src/search.rs $BASE/rust/lance-index/src/scalar/inverted
 - 没有运行本地 Spark 用例（只做静态核实）；所有“行为”判断来自代码/测试断言/文档，标了证据；需要运行才能确认的列在 §7。
 - 没有验证 namespace REST/directory 的实际 plan/metrics（`queryTable` 是 native 方法，Java 侧不可见）；#3262 的集群侧要把 connect/request/IPC 计时补上。
 - `wand_factor`、`fast_search` 对 FTS 的影响、`combined_fields` 的 connector 支持不在本卡范围；已在 §3/§7 标为后续项。
+
+## 14. 修订（2026-11-25）：U1 被本地实测否证后的方案调整
+
+`#3282` 用 DirectoryNamespace + 本地 Spark 实测了第 7 节的三个前提，结论直接改变第 8 节的取舍：
+
+- **U1 否证**：`queryTable` 的 FTS 只保证分数降序，同分行没有全序（同一请求连跑三次返回三种同分顺序）；同分数据按 pageSize=1/2/3/7 逐页取，拼接后重复数恰等于遗漏数（11/11、6/6、7/7、5/5）；分数严格互异时 4 种 pageSize × 3 次完全精确。另外 `k=0` 表示"不限制"、`offset<0` 服务端报错、Spark 对 ranked 查询根本不推 offset（`TakeOrderedAndProject(limit=o+p)`、请求 `k=o+p, offset=null`）。
+- **U2 分数精确、tie 顺序否证**：同分/fuzziness/phrase slop/operator=AND 四类查询的 top-k 分数序列与全量 top-k 逐项相等，但 tie 顺序一致率 0/21、0/7、1/7、2/4，重复执行会换序。
+- **U3 确认且更保守**：residual 时一律保留 `Filter` 且 `k=Integer.MAX_VALUE`；`ORDER BY _score DESC LIMIT k` 即使 k 已下推仍保留 `TakeOrderedAndProject`；`LIMIT 2 OFFSET 2` 变 `TakeOrderedAndProject(limit=4)`；有 residual 时 `pushLimit/pushTopN/pushOffset` 全 false。
+
+因此第 8 节的实施顺序改为：
+
+1. **A（严格等价过滤下推）** —— 先做，与 U1/U2 无关，只缩小 `k=Integer.MAX_VALUE` 的触发面。表达式白名单必须有差分测试（Spark residual vs 下推逐行相等，覆盖 null/负数/Unicode/空串/Decimal），`_score` 永远 residual。
+2. **U5 专项（新前置）** —— `_rowid` 能否作为 `queryTable` 的 filter 列、`prefilter=true` 是否严格"先过滤再排序"。这是 B' 的前提，必须先本地证。
+3. **B'（rowid 范围递归切分）** —— 仅在 U5 成立时启用；按值域二分、每请求有界，不依赖任何排序；作为"有界执行"的默认路径。
+4. **B（offset continuation）禁用** —— 只有 native 在单列 match 的堆/合并处实现 `(score, rowid)` 全序后才可能启用，属 core 改动，不在 #3263。
+5. **C（local 候选上限）保持默认关** —— plan 安全前提已由 U3 确认，但"每 fragment 按 score 的 top-N"在 SQL 路径不可达，需 native 级验证后再谈。
+
+另外两条来自实测的硬约束：读取路径必须防 `k=0`（等于不限制）；任何"分页"式实现都要假设 tie 顺序不稳定，不能把顺序当续取凭据。

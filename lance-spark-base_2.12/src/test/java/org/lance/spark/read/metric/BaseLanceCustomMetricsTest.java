@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -33,9 +34,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public abstract class BaseLanceCustomMetricsTest {
 
   @Test
-  void testAllMetricsReturnsTwelveMetrics() {
+  void testAllMetricsReturnsFourteenMetrics() {
     CustomMetric[] metrics = LanceCustomMetrics.allMetrics();
-    assertEquals(12, metrics.length);
+    assertEquals(14, metrics.length);
   }
 
   @Test
@@ -61,6 +62,8 @@ public abstract class BaseLanceCustomMetricsTest {
                 LanceCustomMetrics.NUM_INDICES_LOADED,
                 LanceCustomMetrics.NUM_PARTS_LOADED,
                 LanceCustomMetrics.NUM_INDEX_COMPARISONS,
+                 "numIndexCacheHits",
+                 "numIndexCacheMisses",
                 LanceCustomMetrics.DATASET_OPEN_TIME_NS,
                 LanceCustomMetrics.SCANNER_CREATE_TIME_NS,
                 LanceCustomMetrics.BATCH_LOAD_TIME_NS));
@@ -158,7 +161,7 @@ public abstract class BaseLanceCustomMetricsTest {
   void testTrackerInitialValues() {
     LanceReadMetricsTracker tracker = new LanceReadMetricsTracker();
     CustomTaskMetric[] values = tracker.currentMetricsValues();
-    assertEquals(12, values.length);
+    assertEquals(14, values.length);
     for (CustomTaskMetric m : values) {
       assertEquals(0L, m.value(), "Initial value should be 0 for " + m.name());
     }
@@ -238,6 +241,36 @@ public abstract class BaseLanceCustomMetricsTest {
     assertEquals(15, tracker.getNumIndicesLoaded());
     assertEquals(50, tracker.getNumPartsLoaded());
     assertEquals(3000, tracker.getNumIndexComparisons());
+  }
+
+  @Test
+  void testCacheCountersSurviveScanStatsTransferAndMetricPolling() {
+    LanceReadMetricsTracker tracker = new LanceReadMetricsTracker();
+    tracker.addScanStats(
+        Optional.of(new ScanStats(3L, 2L, 128L, 1L, 4L, 32L, 7L, 5L,
+            new HashMap<>(), new HashMap<>())));
+
+    Map<String, Long> first = metricValues(tracker);
+    assertEquals(Long.valueOf(7L), first.get("numIndexCacheHits"));
+    assertEquals(Long.valueOf(5L), first.get("numIndexCacheMisses"));
+    tracker.addScanStats(Optional.empty());
+    assertEquals(first, metricValues(tracker), "polling and absent stats must not add work");
+
+    // A table reader can finish several distinct fragment scanners: their counters add once each.
+    tracker.addScanStats(
+        Optional.of(new ScanStats(1L, 1L, 64L, 0L, 2L, 16L, 11L, 2L,
+            new HashMap<>(), new HashMap<>())));
+    Map<String, Long> second = metricValues(tracker);
+    assertEquals(Long.valueOf(18L), second.get("numIndexCacheHits"));
+    assertEquals(Long.valueOf(7L), second.get("numIndexCacheMisses"));
+  }
+
+  private static Map<String, Long> metricValues(LanceReadMetricsTracker tracker) {
+    Map<String, Long> values = new HashMap<>();
+    for (CustomTaskMetric metric : tracker.currentMetricsValues()) {
+      values.put(metric.name(), metric.value());
+    }
+    return values;
   }
 
   @Test

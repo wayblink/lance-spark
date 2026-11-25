@@ -180,6 +180,7 @@ Naming conventions:
 | `numIndicesLoaded` | counter | Number of top-level indices loaded. |
 | `numPartsLoaded` | counter | Number of index partitions loaded. |
 | `numIndexComparisons` | counter | Number of index comparisons performed during vector search. |
+| `numIndexCacheHits` / `numIndexCacheMisses` | counters | Native index-cache lookup hits and misses reported by this scanner. These count cache lookups, not resident files or bytes. |
 | `datasetOpenTimeNs` | duration | Time spent in `Dataset.open(...)` — manifest load, namespace lookup, credential fetch. High values indicate catalog or metadata cache misses. |
 | `scannerCreateTimeNs` | duration | Time spent in `fragment.newScan(...)` — scan planning, predicate compilation, index lookup setup. |
 | `batchLoadTimeNs` | duration | Wall-clock time inside `loadNextBatch` — JNI crossing, IO, and Arrow IPC deserialization. Divide by `numBatchesLoaded` to get per-batch cost. |
@@ -189,9 +190,9 @@ How to read these together:
 - **Pushdown verification**: a low `numRowsScanned / numOutputRows` ratio means filters are being
   pushed down effectively. A 1:1 ratio means every row is being scanned and filtered in Spark —
   check whether your predicate is supported for pushdown.
-- **Per-batch JNI cost**: `batchLoadTimeNs / numBatchesLoaded` gives the average cost of one batch
-  crossing JNI. If this is high relative to total query time, consider increasing
-  `LanceSparkReadOptions.batchSize` to amortize JNI overhead over more rows.
+- **Batch production cost**: `batchLoadTimeNs / numBatchesLoaded` is the average time producing and
+  importing a returned batch. It includes native computation, I/O and Arrow import; it does not
+  isolate JNI overhead. Compare it with the I/O and index-work counters before tuning batch size.
 - **Catalog overhead**: `datasetOpenTimeNs` accumulates per fragment opened. If many fragments are
   opened per task, this can dominate; metadata cache size and namespace caching matter most here.
 
@@ -211,12 +212,32 @@ little differently than a table scan:
 - `numIndexComparisons` / `numPartsLoaded` are non-zero only for tasks that searched an index
   segment; a run that fell back to flat KNN reports zeros there. `numIndicesLoaded` counts whole
   top-level indices opened by the scanner and usually stays zero for a per-segment search.
+- `numIndexCacheHits` / `numIndexCacheMisses` are this scanner's native index-cache lookup counts.
+  A hit does not prove that a whole index file, all IVF lists, or the full table's indexes reside in
+  memory. Pair the counts with bytes read, parts loaded, executor placement and the configured
+  native cache budget; the connector does not report index-residency coverage.
 - `numRowsScanned` comes from Lance's own per-scan counter: rows read from storage, including the
   fetches that assemble the top-k rows. It measures work done rather than rows matched, and is the
   first thing to compare between two runs — if both read the same rows, a wall-clock difference is
   not a difference in the work. Lance's `fragments_scanned` counter is deliberately not mapped to
   `numFragmentsScanned`: it counts physical fragment scans (2 for a task that scans one fragment),
   so it would not mean what that scan-node column says.
+
+The distributed search scan also publishes two **driver-only** durations on its SQL scan node:
+
+| Metric | Description |
+|---|---|
+| `driverPlanningTimeNs` | One partition-planning attempt, including dataset open/close, index discovery and unit creation. |
+| `driverIndexDiscoveryTimeNs` | The portion of planning spent resolving the column and discovering/selecting the vector index, including statistics fallback when needed. |
+
+These are snapshots from planning, not task counters: repeated reporting or reading the cached
+partition plan does not add them again, and reading metrics never starts dataset I/O. Before planning,
+zero means not measured. The discovery duration is included in planning; do not add them together.
+Plans and driver planning logs carry a stable `scanId` to associate them with the scan's SQL execution.
+Use Spark's existing Sort, Window, Exchange and stage metrics for global merging rather than adding
+another overlapping merge timer. Summed task durations describe work across workers, not query
+wall-clock time; `batchLoadTimeNs` is not a JNI-only timer. Metrics collection does not change the
+search's candidates, ordering or cache policy.
 
 Namespace-executed search (the default) has no equivalent. It returns results through `queryTable`,
 whose response carries Arrow data only, so its scan node shows no Lance metrics at all; attribute

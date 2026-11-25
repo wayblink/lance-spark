@@ -39,6 +39,8 @@ public class LanceReadMetricsTracker {
   private long numIndicesLoaded;
   private long numPartsLoaded;
   private long numIndexComparisons;
+  private long numIndexCacheHits;
+  private long numIndexCacheMisses;
   private long datasetOpenTimeNs;
   private long scannerCreateTimeNs;
   private long batchLoadTimeNs;
@@ -147,6 +149,28 @@ public class LanceReadMetricsTracker {
         new CustomTaskMetric() {
           @Override
           public String name() {
+            return LanceCustomMetrics.NUM_INDEX_CACHE_HITS;
+          }
+
+          @Override
+          public long value() {
+            return numIndexCacheHits;
+          }
+        },
+        new CustomTaskMetric() {
+          @Override
+          public String name() {
+            return LanceCustomMetrics.NUM_INDEX_CACHE_MISSES;
+          }
+
+          @Override
+          public long value() {
+            return numIndexCacheMisses;
+          }
+        },
+        new CustomTaskMetric() {
+          @Override
+          public String name() {
             return LanceCustomMetrics.DATASET_OPEN_TIME_NS;
           }
 
@@ -213,6 +237,8 @@ public class LanceReadMetricsTracker {
     numIndicesLoaded += stats.getIndicesLoaded();
     numPartsLoaded += stats.getPartsLoaded();
     numIndexComparisons += stats.getIndexComparisons();
+    numIndexCacheHits += stats.getIndexCacheHits();
+    numIndexCacheMisses += stats.getIndexCacheMisses();
   }
 
   /** Returns current snapshot of all metrics. Called by PartitionReader.currentMetricsValues(). */

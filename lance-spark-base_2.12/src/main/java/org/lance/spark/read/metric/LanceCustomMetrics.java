@@ -16,6 +16,8 @@ package org.lance.spark.read.metric;
 import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.metric.CustomSumMetric;
 
+import java.util.Arrays;
+
 /**
  * Custom metrics for the Lance read path, displayed on the Spark UI Scan node.
  *
@@ -42,10 +44,14 @@ public final class LanceCustomMetrics {
   public static final String NUM_INDICES_LOADED = "numIndicesLoaded";
   public static final String NUM_PARTS_LOADED = "numPartsLoaded";
   public static final String NUM_INDEX_COMPARISONS = "numIndexComparisons";
+  public static final String NUM_INDEX_CACHE_HITS = "numIndexCacheHits";
+  public static final String NUM_INDEX_CACHE_MISSES = "numIndexCacheMisses";
 
   public static final String DATASET_OPEN_TIME_NS = "datasetOpenTimeNs";
   public static final String SCANNER_CREATE_TIME_NS = "scannerCreateTimeNs";
   public static final String BATCH_LOAD_TIME_NS = "batchLoadTimeNs";
+  public static final String DRIVER_PLANNING_TIME_NS = "driverPlanningTimeNs";
+  public static final String DRIVER_INDEX_DISCOVERY_TIME_NS = "driverIndexDiscoveryTimeNs";
 
   private LanceCustomMetrics() {}
 
@@ -159,6 +165,30 @@ public final class LanceCustomMetrics {
     }
   }
 
+  public static class NumIndexCacheHitsMetric extends CustomSumMetric {
+    @Override
+    public String name() {
+      return NUM_INDEX_CACHE_HITS;
+    }
+
+    @Override
+    public String description() {
+      return "number of native index cache hits";
+    }
+  }
+
+  public static class NumIndexCacheMissesMetric extends CustomSumMetric {
+    @Override
+    public String name() {
+      return NUM_INDEX_CACHE_MISSES;
+    }
+
+    @Override
+    public String description() {
+      return "number of native index cache misses";
+    }
+  }
+
   public static class DatasetOpenTimeNsMetric extends CustomNsTimeMetric {
     @Override
     public String name() {
@@ -179,7 +209,7 @@ public final class LanceCustomMetrics {
 
     @Override
     public String description() {
-      return "time to create fragment scanner";
+      return "time to create Lance scanner";
     }
   }
 
@@ -191,7 +221,31 @@ public final class LanceCustomMetrics {
 
     @Override
     public String description() {
-      return "time to load Arrow batch (JNI + IPC deserialization)";
+      return "time producing/importing Arrow batches (native work, I/O, IPC)";
+    }
+  }
+
+  public static class DriverPlanningTimeNsMetric extends CustomNsTimeMetric {
+    @Override
+    public String name() {
+      return DRIVER_PLANNING_TIME_NS;
+    }
+
+    @Override
+    public String description() {
+      return "driver time to plan distributed Lance search";
+    }
+  }
+
+  public static class DriverIndexDiscoveryTimeNsMetric extends CustomNsTimeMetric {
+    @Override
+    public String name() {
+      return DRIVER_INDEX_DISCOVERY_TIME_NS;
+    }
+
+    @Override
+    public String description() {
+      return "driver time to discover and select vector index";
     }
   }
 
@@ -205,10 +259,20 @@ public final class LanceCustomMetrics {
     new NumIndicesLoadedMetric(),
     new NumPartsLoadedMetric(),
     new NumIndexComparisonsMetric(),
+    new NumIndexCacheHitsMetric(),
+    new NumIndexCacheMissesMetric(),
     new DatasetOpenTimeNsMetric(),
     new ScannerCreateTimeNsMetric(),
     new BatchLoadTimeNsMetric(),
   };
+
+  /** Search-only driver timings are never emitted by a task reader. */
+  public static CustomMetric[] distributedSearchMetrics() {
+    CustomMetric[] metrics = Arrays.copyOf(ALL_METRICS, ALL_METRICS.length + 2);
+    metrics[ALL_METRICS.length] = new DriverPlanningTimeNsMetric();
+    metrics[ALL_METRICS.length + 1] = new DriverIndexDiscoveryTimeNsMetric();
+    return metrics;
+  }
 
   /** Returns all supported custom metrics, used by LanceScan.supportedCustomMetrics(). */
   public static CustomMetric[] allMetrics() {

@@ -15,8 +15,11 @@ package org.lance.spark.search;
 
 import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
+import org.lance.spark.LanceSparkReadOptions;
+import org.lance.spark.TestUtils;
 import org.lance.spark.search.LanceSearchQuery.SearchType;
 
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.Test;
 
@@ -35,6 +38,46 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class LanceDistributedSearchScanTest {
+  @Test
+  void readingDriverMetricsDoesNotOpenTheDataset() {
+    LanceDistributedSearchScan scan = scanForPlanning("file:/missing-metrics-only-dataset");
+    Map<String, Long> metrics = driverMetrics(scan);
+    assertEquals(Long.valueOf(0L), metrics.get("driverPlanningTimeNs"));
+    assertEquals(Long.valueOf(0L), metrics.get("driverIndexDiscoveryTimeNs"));
+  }
+
+  @Test
+  void driverPlanningMetricsAreSnapshotsRatherThanRepeatedAccumulation() {
+    // Planning needs only this real fixture's manifest/schema/index listing; no nearest scan runs.
+    LanceDistributedSearchScan scan = scanForPlanning(TestUtils.TestTable1Config.datasetUri);
+    scan.planInputPartitions();
+    Map<String, Long> first = driverMetrics(scan);
+    assertTrue(first.getOrDefault("driverPlanningTimeNs", 0L) > 0L);
+    assertTrue(first.getOrDefault("driverIndexDiscoveryTimeNs", 0L) > 0L);
+    assertTrue(first.get("driverPlanningTimeNs") >= first.get("driverIndexDiscoveryTimeNs"));
+    scan.planInputPartitions();
+    assertEquals(first, driverMetrics(scan), "cached planning and reporting must not count twice");
+  }
+
+  private static LanceDistributedSearchScan scanForPlanning(String uri) {
+    LanceSearchQuery query = LanceSearchQuery.builder(SearchType.VECTOR)
+        .tableId(Arrays.asList("ns", "table"))
+        .namespaceImpl("dir")
+        .readOptions(LanceSparkReadOptions.from(uri))
+        .vector(Collections.singletonList(0.0f))
+        .vectorColumn("x")
+        .build();
+    return new LanceDistributedSearchScan(new StructType(), query);
+  }
+
+  private static Map<String, Long> driverMetrics(LanceDistributedSearchScan scan) {
+    Map<String, Long> values = new HashMap<>();
+    for (CustomTaskMetric metric : scan.reportDriverMetrics()) {
+      values.put(metric.name(), metric.value());
+    }
+    return values;
+  }
+
   @Test
   void legacyStatisticsUseSegmentMetricInsteadOfNestedStorageMetric() {
     Map<String, Object> storage = new HashMap<>();

@@ -25,6 +25,7 @@ import org.lance.spark.utils.Utils;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.spark.sql.connector.metric.CustomMetric;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
@@ -68,6 +69,9 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
 
   private final StructType schema;
   private final LanceSearchQuery query;
+  private final String scanId = UUID.randomUUID().toString();
+  private transient long driverPlanningTimeNs;
+  private transient long driverIndexDiscoveryTimeNs;
 
   /**
    * Planned once per scan. Spark builds a fresh {@code BatchScanExec} for every materialization of
@@ -90,7 +94,7 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
 
   @Override
   public String description() {
-    return "LanceDistributedSearchScan";
+    return "LanceDistributedSearchScan [scanId=" + scanId + "]";
   }
 
   @Override
@@ -109,7 +113,38 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
    */
   @Override
   public CustomMetric[] supportedCustomMetrics() {
-    return LanceCustomMetrics.allMetrics();
+    return LanceCustomMetrics.distributedSearchMetrics();
+  }
+
+  /** A snapshot only: reporting metrics must not trigger dataset or index I/O. */
+  @Override
+  public synchronized CustomTaskMetric[] reportDriverMetrics() {
+    long planning = driverPlanningTimeNs;
+    long discovery = driverIndexDiscoveryTimeNs;
+    return new CustomTaskMetric[] {
+      new CustomTaskMetric() {
+        @Override
+        public String name() {
+          return LanceCustomMetrics.DRIVER_PLANNING_TIME_NS;
+        }
+
+        @Override
+        public long value() {
+          return planning;
+        }
+      },
+      new CustomTaskMetric() {
+        @Override
+        public String name() {
+          return LanceCustomMetrics.DRIVER_INDEX_DISCOVERY_TIME_NS;
+        }
+
+        @Override
+        public long value() {
+          return discovery;
+        }
+      }
+    };
   }
 
   @Override
@@ -121,6 +156,30 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
   }
 
   private InputPartition[] planPartitionsOnce() {
+    long started = System.nanoTime();
+    driverIndexDiscoveryTimeNs = 0L;
+    boolean succeeded = false;
+    try {
+      InputPartition[] partitions = planPartitions();
+      succeeded = true;
+      return partitions;
+    } finally {
+      driverPlanningTimeNs = System.nanoTime() - started;
+      try {
+        LOG.info(
+            "Lance distributed search planning: scanId={}, succeeded={}, planningTimeNs={}, "
+                + "indexDiscoveryTimeNs={}",
+            scanId,
+            succeeded,
+            driverPlanningTimeNs,
+            driverIndexDiscoveryTimeNs);
+      } catch (RuntimeException ignored) {
+        // Diagnostics must not replace a successful result or the original planning failure.
+      }
+    }
+  }
+
+  private InputPartition[] planPartitions() {
     Dataset dataset =
         Utils.openDatasetBuilder(query.getReadOptions())
             .initialStorageOptions(query.getInitialStorageOptions())
@@ -144,19 +203,24 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
         throw new IllegalArgumentException(
             "index must name a vector index; an empty name cannot select one");
       }
-      NamedVectorIndex namedIndex =
+      long discoveryStart = System.nanoTime();
+      NamedVectorIndex namedIndex;
+      String column;
+      Optional<VectorIndexInfo> vectorIndex;
+      try {
+        namedIndex =
           requestedIndex != null
               ? resolveNamedVectorIndex(dataset, requestedIndex, query.getVectorColumn())
               : null;
       // A named index decides the column, even when the search bypasses the index: the caller
       // named an index, so the column it was built on is the one they mean.
-      String column = namedIndex != null ? namedIndex.column : resolveVectorColumn();
+      column = namedIndex != null ? namedIndex.column : resolveVectorColumn();
       if (namedIndex != null && bypassVectorIndex) {
         // bypass_vector_index means "do not search an index"; naming one is not a conflict worth
         // failing on, but it must not look as if the named index was used.
         LOG.warn("Ignoring index {} because bypass_vector_index=true", requestedIndex);
       }
-      Optional<VectorIndexInfo> vectorIndex =
+      vectorIndex =
           bypassVectorIndex
               ? Optional.empty()
               : selectVectorIndex(
@@ -166,6 +230,9 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
                   fastSearch,
                   namedIndex == null ? null : namedIndex.description,
                   namedIndex == null ? null : namedIndex.allIndices);
+      } finally {
+        driverIndexDiscoveryTimeNs = System.nanoTime() - discoveryStart;
+      }
 
       // A segment whose fragments are all gone (compaction, deletion) is stale: no unit for it.
       Set<Integer> fallbackFragments = new TreeSet<>(existingFragments);
@@ -224,8 +291,9 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
 
       long indexedCount = units.stream().filter(u -> !u.getIndexSegments().isEmpty()).count();
       LOG.info(
-          "Lance distributed vector search: column={}, indexName={}, units={} "
+          "Lance distributed vector search: scanId={}, column={}, indexName={}, units={} "
               + "(indexed={}, fallback={}), candidateK={}",
+          scanId,
           column,
           vectorIndex.map(VectorIndexInfo::getIndexName).orElse("none"),
           units.size(),

@@ -129,7 +129,7 @@ public abstract class BaseLanceReadMetricsIntegrationTest {
   @Test
   void testSupportedCustomMetricsCount() {
     CustomMetric[] metrics = LanceCustomMetrics.allMetrics();
-    assertEquals(12, metrics.length);
+    assertEquals(14, metrics.length);
   }
 
   @Test

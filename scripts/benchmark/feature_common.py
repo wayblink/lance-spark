@@ -27,6 +27,22 @@ ACCOUNTED_FIELDS = (
     "feature_card",
 )
 
+# Frozen baseline contract (scripts/benchmark/baseline-10m.json). Any file read through
+# --baseline must hash to this value, otherwise the five-cell comparison is not the same one.
+BASELINE_SHA256 = "a29c97557f178e877ff9c9d29c42dfd186e13ffce3fde250ef427520342a19f4"
+
+# The runner files that actually submit and validate cells. They may only be synced to the
+# remote host when their bytes match the reviewed version (the one that produced C5/b102cc7
+# behaviour plus the single-tolerance window fix). Anything else is refused before ssh.
+RUNNER_SHA256 = {
+    "submit.py": "e59d8ac86cf4cdd9b7bd9490679cfe98cc2c69ba333883a0e8d9785813fe1e09",
+    "baseline.py": "3ac5a95659db6746afd27a3585dff4c1de8a1d4caf9bc0c13424587245a7b363",
+    "pilot.py": "1e9f57b422cf98b98b62c87eb9c28d42b5f1c3931b5a026267389c4cedc1c9d7",
+    "benchmark.py": "0d199446575427f37e2977f858066286792151830c34745eb307ab7e1a4fd77c",
+    "BaselineBenchmark.java": "a5ea65c0e6603882255e6a2e61c4953eb010ef62140e8c4675715f58ae5a83a8",
+    "verified-stopped-drivers.json": "299287912c4dba978ef58c4333c2a7337444d5b92cffc027a39244e340577db8",
+}
+
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 HEX_RE = re.compile(r"[0-9a-f]{64}")
 COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
@@ -81,6 +97,30 @@ def require_remote_path(value, label="remote path"):
     require("~" not in value[1:], label + " may use ~ only as the first character")
     require(".." not in value.split("/"), label + " must not contain .. path segments")
     return value
+
+
+def require_baseline_pin(path):
+    """Refuse a baseline contract whose bytes differ from the frozen one."""
+    actual = sha256_file(path)
+    require(actual == BASELINE_SHA256,
+            "baseline contract is not the frozen file: %s (expected %s)"
+            % (actual, BASELINE_SHA256))
+    return actual
+
+
+def verify_runner_hashes(script_dir, expected=None):
+    """Verify the bytes that would be synced to the remote host against the runner pins."""
+    expected = RUNNER_SHA256 if expected is None else expected
+    actual = {}
+    for name, want in expected.items():
+        path = Path(script_dir) / name
+        require(path.is_file(), "runner file missing: " + str(path))
+        got = sha256_file(path)
+        require(got == want,
+                "runner pin mismatch for %s: %s != %s; refusing to sync a different runner"
+                % (name, got, want))
+        actual[name] = got
+    return actual
 
 
 def canonical(value):

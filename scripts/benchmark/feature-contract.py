@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Derive a feature contract from the frozen baseline contract; offline only.
 
-Only these fields may differ from --baseline:
+--baseline must be the frozen contract (sha256 pinned in feature_common.BASELINE_SHA256).
+Only these fields may differ from it:
   image, image_digest, image_bundle_sha256, feature_commit, parent_image, feature_card
 Everything else must stay semantically identical, which is verified by a canonical-JSON
 comparison before anything is written. The derived file is written to a temporary name,
@@ -50,6 +51,9 @@ def derive(base, image, image_digest, image_bundle_sha256, feature_commit,
             "image_bundle_sha256 must be 64 lowercase hex characters")
     require(feature_common.is_commit(feature_commit), "feature_commit must be 7-40 lowercase hex")
     feature_common.require_digest_ref(parent_image, "parent_image")
+    require(image_digest != base["image_digest"],
+            "derived image_digest equals the baseline digest; a rerun would measure the same "
+            "jar, so this contract is refused")
     card = normalize_card(feature_card)
     derived = dict(base)
     derived.update({"image": image, "image_digest": image_digest,
@@ -131,6 +135,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     require(args.baseline.is_file(), "baseline contract not found: " + str(args.baseline))
+    feature_common.require_baseline_pin(args.baseline)
     base = json.loads(args.baseline.read_text())
     payload = json.loads(args.image_json.read_text()) if args.image_json else {}
 
@@ -162,9 +167,6 @@ def main(argv=None):
     else:
         print(json.dumps(derived, indent=2))
         print(json.dumps(summary), file=sys.stderr)
-    if derived["image_digest"] == base["image_digest"]:
-        print("WARNING: derived image digest equals the baseline digest; the rebuild may be a "
-              "no-op, so a comparison would measure the same jar.", file=sys.stderr)
     return summary
 
 

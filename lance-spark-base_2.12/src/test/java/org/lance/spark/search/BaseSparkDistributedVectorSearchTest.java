@@ -357,10 +357,14 @@ public abstract class BaseSparkDistributedVectorSearchTest {
   }
 
   private static StructType findBatchScanSchema(Dataset<Row> dataset) {
-    return findBatchScanSchema(dataset.queryExecution().executedPlan());
+    StructType schema = findBatchScanSchemaOrNull(dataset.queryExecution().executedPlan());
+    assertTrue(
+        schema != null,
+        "VECTOR_SEARCH BatchScanExec not found in " + dataset.queryExecution().executedPlan());
+    return schema;
   }
 
-  private static StructType findBatchScanSchema(SparkPlan plan) {
+  private static StructType findBatchScanSchemaOrNull(SparkPlan plan) {
     if (plan instanceof BatchScanExec) {
       Scan scan = ((BatchScanExec) plan).scan();
       if (scan.readSchema().fieldNames().length > 0
@@ -369,16 +373,16 @@ public abstract class BaseSparkDistributedVectorSearchTest {
       }
     }
     if (plan instanceof AdaptiveSparkPlanExec) {
-      return findBatchScanSchema(((AdaptiveSparkPlanExec) plan).executedPlan());
+      return findBatchScanSchemaOrNull(((AdaptiveSparkPlanExec) plan).executedPlan());
     }
     if (plan instanceof QueryStageExec) {
-      return findBatchScanSchema(((QueryStageExec) plan).plan());
+      return findBatchScanSchemaOrNull(((QueryStageExec) plan).plan());
     }
     for (SparkPlan child : scala.collection.JavaConverters.seqAsJavaList(plan.children())) {
-      StructType result = findBatchScanSchema(child);
+      StructType result = findBatchScanSchemaOrNull(child);
       if (result != null) return result;
     }
-    throw new AssertionError("VECTOR_SEARCH BatchScanExec not found in " + plan);
+    return null;
   }
 
   private List<Integer> idsOf(String sql) {

@@ -1103,6 +1103,84 @@ public abstract class BaseSparkDistributedVectorSearchIndexTest {
     assertEquals(100, rows.get(3).getInt(1), "the next qid is query 1 and finds its nearest row");
   }
 
+  /**
+   * An indexed batch cut into several native scans must answer exactly what the same batch answers
+   * in one scan. Each unit is one index segment here, so the two-index-segment table runs two
+   * native scans per task when the budget admits two of the four queries.
+   */
+  @Test
+  void aChunkedIndexedBatchAnswersExactlyWhatAnUnchunkedBatchAnswers() throws Exception {
+    String table = createTable("vec_batch_chunked", 2);
+    buildSegmentPerFragment(table, fragmentIds(table));
+
+    String sql =
+        "SELECT query_id, id, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', queries => array('"
+            + literalVector(100.0)
+            + "', '"
+            + literalVector(5.0)
+            + "', '"
+            + literalVector(40.0)
+            + "', '"
+            + literalVector(70.0)
+            + "'), k => 2, nprobes => "
+            + NUM_PARTITIONS
+            + ", index => '"
+            + INDEX_NAME
+            + "') ORDER BY query_id, _distance, id";
+
+    // Per query: 8 floats of keys (32 B) plus two rows of 20 B, so 288 B for four queries and a
+    // 144 B budget admits two queries per native scan.
+    List<Row> unchunked = collect(sql, true);
+
+    LanceTaskMetricsListener listener = new LanceTaskMetricsListener();
+    spark.sparkContext().addSparkListener(listener);
+    List<Row> chunked;
+    try {
+      spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "144");
+      chunked = collect(sql, true);
+      spark.sparkContext().listenerBus().waitUntilEmpty(5000);
+    } finally {
+      spark.sparkContext().removeSparkListener(listener);
+      spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "67108864");
+    }
+
+    assertEquals(unchunked.size(), chunked.size(), "chunking must not change the row count");
+    for (int row = 0; row < unchunked.size(); row++) {
+      assertEquals(
+          unchunked.get(row).getInt(0), chunked.get(row).getInt(0), "row " + row + " query_id");
+      assertEquals(unchunked.get(row).getInt(1), chunked.get(row).getInt(1), "row " + row + " id");
+      assertEquals(
+          unchunked.get(row).getFloat(2),
+          chunked.get(row).getFloat(2),
+          1e-6f,
+          "row " + row + " _distance");
+    }
+    assertEquals(8, chunked.size(), "four queries times k rows");
+
+    // Two index segments are two units; each ran two native scans, and the queries are attributed
+    // to the batch positions they came from, so every query id appears k times.
+    java.util.Map<String, Long> metrics = listener.metricValues();
+    assertEquals(
+        Long.valueOf(4L),
+        metrics.get(LanceCustomMetrics.NUM_BATCH_CHUNKS),
+        "two units times two chunks, got " + metrics);
+    assertEquals(
+        Long.valueOf(8L),
+        metrics.get(LanceCustomMetrics.NUM_BATCH_CHUNK_QUERIES),
+        "two units times four queries, got " + metrics);
+    for (int query = 0; query < 4; query++) {
+      int seen = 0;
+      for (Row row : chunked) {
+        if (row.getInt(0) == query) {
+          seen++;
+        }
+      }
+      assertEquals(2, seen, "query " + query + " must keep exactly k rows after the merge");
+    }
+  }
+
   /** Two query sources at once is a mistake, not something to pick from. */
   @Test
   void batchSearchRejectsTwoQuerySources() {

@@ -148,7 +148,8 @@ class LanceDistributedSearchScanTest {
             .nprobes(7)
             .build();
     LanceDistributedSearchInputPartition partition =
-        LanceDistributedSearchInputPartition.forFragment(new StructType(), query, 1, "test-scan");
+        LanceDistributedSearchInputPartition.forFragment(
+            new StructType(), query, 1, LanceBatchChunkPlan.singleQuery(), "test-scan");
 
     // An explicit nprobes means exactly that many probes, matching how lance maps the field on a
     // namespace query since lance#9184.
@@ -174,13 +175,17 @@ class LanceDistributedSearchScanTest {
     ScanOptions fallback =
         LanceDistributedSearchColumnarPartitionReader.buildScanOptions(
             LanceDistributedSearchInputPartition.forFragment(
-                new StructType(), query, 1, "test-scan"));
+                new StructType(), query, 1, LanceBatchChunkPlan.singleQuery(), "test-scan"));
     assertFalse(fallback.getNearest().get().isUseIndex(), "flat unit must not use the index");
 
     ScanOptions indexed =
         LanceDistributedSearchColumnarPartitionReader.buildScanOptions(
             LanceDistributedSearchInputPartition.forIndexSegment(
-                new StructType(), query, UUID.randomUUID(), "test-scan"));
+                new StructType(),
+                query,
+                UUID.randomUUID(),
+                LanceBatchChunkPlan.singleQuery(),
+                "test-scan"));
     assertTrue(indexed.getNearest().get().isUseIndex(), "indexed unit must use the index");
   }
 

@@ -169,6 +169,19 @@ silently changing what the filter means.
 apply them yet. Disable `spark.sql.lance.search.distributed.enabled` to run any of these through
 the namespace.
 
+### Batch query chunking
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `spark.sql.lance.search.batch.chunk.bytes` | `67108864` | Estimated working set one native scan of a batch search may hold: the queries' keys plus the `queries x k` rows it returns. A larger batch is cut into chunks in input order, one native scan each, so executor memory stays bounded. `query_id` is unaffected by the cut. |
+| `spark.sql.lance.search.batch.chunk.queries` | `0` | Hard cap on queries per native scan, whatever the byte budget allows. `0` disables the cap. |
+| `spark.sql.lance.search.batch.min.queries` | `1` | Floor on queries per native scan. A budget smaller than the floor leaves the chunk over budget and logs a warning, instead of opening one scan per query. |
+
+A batch inside the budget runs as one native scan per search unit, so the defaults change nothing
+for a batch of the size a query normally has. See [batch size and
+chunking](operations/dql/vector-search.md#batch-size-and-chunking) for the rule, the metrics and the
+estimate's limits.
+
 ### Deferred payload fetch
 
 | Option | Default | Description |

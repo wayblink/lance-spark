@@ -226,6 +226,51 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
     assertEquals(rowsAsString(fused), rowsAsString(deferred));
   }
 
+  /**
+   * Chunking a batch and deferring its payload are independent cuts of the same query, so both at
+   * once must still answer the unchunked fused plan's rows: the fetch attributes winners to a query
+   * by the same `query_index` the chunk base shifted.
+   */
+  @Test
+  void aChunkedDeferredBatchAgreesWithTheUnchunkedFusedPlan() throws Exception {
+    assumeNamedArguments();
+    String table = createTable("chunked_batch", 6);
+    String sql =
+        "SELECT query_id, id, name, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', queries => array('0.0,0.0,0.0,0.0', '3.0,3.0,3.0,3.0', "
+            + "'6.0,6.0,6.0,6.0'), k => 3, columns => array('id', 'name'))"
+            + " ORDER BY query_id, _distance, id";
+
+    List<Row> fused = collect(sql, "off");
+    assertEquals(9, fused.size(), "three queries times k rows");
+
+    // 64 bytes admits one query per native scan in both shapes: the fused scan charges the payload
+    // width for `id` and `name`, the deferred narrow scan does not, and both stay above 64 bytes.
+    LanceTaskMetricsListener listener = new LanceTaskMetricsListener();
+    spark.sparkContext().addSparkListener(listener);
+    spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "64");
+    try {
+      List<Row> chunkedFused = collect(sql, "off");
+      List<Row> chunkedDeferred = collect(sql, "force");
+      spark.sparkContext().listenerBus().waitUntilEmpty(5000);
+      assertEquals(rowsAsString(fused), rowsAsString(chunkedFused), "chunking alone");
+      assertEquals(
+          rowsAsString(fused),
+          rowsAsString(chunkedDeferred),
+          "chunking plus a deferred fetch must attribute every payload to its own query");
+      // Six fragments are six units and each chunk holds one query, so the runs really were cut.
+      java.util.Map<String, Long> metrics = listener.metricValues();
+      assertTrue(
+          metrics.getOrDefault(org.lance.spark.read.metric.LanceCustomMetrics.NUM_BATCH_CHUNKS, 0L)
+              >= 18L,
+          "both runs must have chunked: six units times three chunks, got " + metrics);
+    } finally {
+      spark.sparkContext().removeSparkListener(listener);
+      spark.conf().unset("spark.sql.lance.search.batch.chunk.bytes");
+    }
+  }
+
   @Test
   void smallFetchChunksReturnTheSameRows() {
     assumeNamedArguments();

@@ -89,6 +89,18 @@ A batch search returns `k` rows per query and puts a non-null `query_id` integer
 the query's position in the batch, zero-based: with `query_table` and `query_id_column` it follows
 that column's order, otherwise the order the queries were given in.
 
+`query_id` is exactly that position and nothing else, which makes it a contract rather than a
+convenience:
+
+- A business id is payload only. Duplicate ids, `NULL` ids, ids out of insertion order, and an
+  ordering column that is not unique all leave the numbering `0..n-1` untouched; a unique ordering
+  column is what makes the *mapping* between an id and a position stable across runs, and without
+  one the order among rows that tie on the ordering value is unspecified.
+- Rows of `query_table` whose vector is `NULL` are skipped, and skipping does not leave holes: the
+  numbering stays contiguous over the rows that were kept.
+- Chunking (below) never renumbers. Whatever number of native scans answers the batch, query `i` is
+  still query `i`, and a chunked batch returns the same rows as an unchunked one.
+
 ## Batch search
 
 One search can answer many queries. Name them inline, or point at a table that holds one vector per
@@ -128,6 +140,46 @@ query's results cannot crowd out another's.
 A batch search requires `spark.sql.lance.search.distributed.enabled=true`: the namespace
 `queryTable` response carries no per-query attribution, so the namespace path rejects a batch rather
 than return rows that cannot be assigned to a query. `offset` and a batch are mutually exclusive.
+
+### Batch size and chunking
+
+One native scan answers a whole chunk of queries, and how many queries a chunk holds is decided from
+a byte budget:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `spark.sql.lance.search.batch.chunk.bytes` | `67108864` | Estimated working set one native scan may hold: the queries' keys plus the `queries x k` rows it returns. Lower it to bound executor memory, raise it to open fewer scans. |
+| `spark.sql.lance.search.batch.chunk.queries` | `0` | Hard cap on queries per native scan, whatever the budget allows. `0` disables the cap. |
+| `spark.sql.lance.search.batch.min.queries` | `1` | Floor on queries per native scan. If the budget admits fewer, the floor wins and a warning reports that the chunk is over budget; the alternative would be one scan per query, whose index lookup usually costs more than the memory it saves. |
+
+A batch whose estimated working set fits the budget runs as one native scan per search unit, which
+is what the defaults do for the sizes a batch normally has: 100 queries of a 1536-dimensional table
+at `k = 100` is about 14 MiB, well under 64 MiB. A larger batch is cut into chunks of
+`floor(budget / (dimension x 4 + k x estimated row width))` queries, in input order.
+
+Chunking changes no answer: each task opens the dataset once and runs one scan per chunk, the
+per-scan `query_index` is shifted back to the batch position, and the global ranking is the same
+merge either way. What it bounds is the memory in flight - at most
+`units x chunkQueries x k` rows instead of `units x queries x k`. It does not bound the query
+matrix, which every task carries in full, and it is applied inside a task rather than by adding
+tasks: more tasks would open the dataset and its index once per chunk and would run concurrently,
+so the peak would not drop.
+
+The division is visible where the other executions details are:
+
+- `EXPLAIN` shows it on the scan node, for example
+  `LanceDistributedSearchScan [scanId=..., queries=100, chunkQueries=25, chunks=4, ...]`.
+- The driver logs one planning line per batch search with `chunks`, `queriesPerNativeScan`,
+  `estimatedBytesPerNativeScan` and `worstCaseRowsInFlight`.
+- The scan node's task metrics add `numBatchChunks` (native scans opened, summed over tasks),
+  `numBatchChunkQueries` (queries submitted, summed) and `numBatchChunkBytes` (estimated bytes
+  submitted, summed). Divide by the task count for the per-task value; a single-query search leaves
+  all three at zero.
+
+The budget is an estimate, not an allocator: a Spark `ArrayType` does not record a
+fixed-size-list length, so a payload column is charged a nominal width. Measure the real footprint if
+a batch is at the edge of what an executor can hold, and lower `chunk.bytes` with the observed width
+rather than the estimated one.
 
 ## Choosing an index
 

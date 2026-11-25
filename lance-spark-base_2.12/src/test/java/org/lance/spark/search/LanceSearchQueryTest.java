@@ -26,6 +26,80 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class LanceSearchQueryTest {
+
+  private static LanceSearchQuery batch(float... flat) {
+    java.util.List<java.util.List<Float>> queries = new java.util.ArrayList<>();
+    for (int row = 0; row + 2 <= flat.length; row += 2) {
+      queries.add(Arrays.asList(flat[row], flat[row + 1]));
+    }
+    return LanceSearchQuery.builder(SearchType.VECTOR)
+        .tableId(Arrays.asList("ns", "table"))
+        .namespaceImpl("dir")
+        .topK(5)
+        .vectors(queries)
+        .vectorColumn("vector")
+        .build();
+  }
+
+  /** A chunk keeps its queries where they are in the batch: nothing is renumbered here. */
+  @Test
+  void subBatchKeepsTheQueriesOfTheOriginalBatch() {
+    LanceSearchQuery original = batch(0f, 0f, 1f, 1f, 2f, 2f, 3f, 3f);
+
+    LanceSearchQuery middle = original.subBatch(1, 2);
+
+    assertEquals(2, middle.getQueryCount());
+    assertEquals(2, middle.getVectorDim());
+    assertEquals(Arrays.asList(1f, 1f, 2f, 2f), middle.getVectors());
+    assertEquals(5, middle.getK(), "k survives the cut");
+    assertEquals("vector", middle.getVectorColumn());
+    assertEquals("dir", middle.getNamespaceImpl());
+    assertEquals(Arrays.asList("ns", "table"), middle.getTableId());
+  }
+
+  @Test
+  void subBatchOfTheWholeRangeIsTheWholeBatch() {
+    LanceSearchQuery original = batch(0f, 0f, 1f, 1f);
+
+    LanceSearchQuery whole = original.subBatch(0, 2);
+
+    assertEquals(2, whole.getQueryCount());
+    assertEquals(original.getVectors(), whole.getVectors());
+  }
+
+  @Test
+  void subBatchRejectsARangeOutsideTheBatch() {
+    LanceSearchQuery original = batch(0f, 0f, 1f, 1f);
+
+    assertThrows(IllegalArgumentException.class, () -> original.subBatch(1, 2));
+    assertThrows(IllegalArgumentException.class, () -> original.subBatch(-1, 1));
+    assertThrows(IllegalArgumentException.class, () -> original.subBatch(0, 0));
+  }
+
+  @Test
+  void subBatchOfASingleVectorQueryIsAMistake() {
+    LanceSearchQuery single =
+        LanceSearchQuery.builder(SearchType.VECTOR)
+            .tableId(Arrays.asList("ns", "table"))
+            .namespaceImpl("dir")
+            .vector(Arrays.asList(1.0f, 2.0f))
+            .build();
+
+    assertThrows(IllegalStateException.class, () -> single.subBatch(0, 1));
+  }
+
+  /** The flat form a chunk is built from has to be exactly `queries x dimension` floats. */
+  @Test
+  void theFlatBatchBuilderRejectsAWrongNumberOfFloats() {
+    LanceSearchQuery.Builder builder =
+        LanceSearchQuery.builder(SearchType.VECTOR)
+            .tableId(Arrays.asList("ns", "table"))
+            .namespaceImpl("dir");
+
+    assertThrows(IllegalArgumentException.class, () -> builder.batch(Arrays.asList(1f, 2f), 2, 2));
+    assertThrows(IllegalArgumentException.class, () -> builder.batch(Arrays.asList(1f, 2f), 0, 2));
+  }
+
   @Test
   void toBuilderPreservesEveryVectorQueryField() {
     LanceSparkReadOptions readOptions = LanceSparkReadOptions.from("file:///tmp/query.lance");

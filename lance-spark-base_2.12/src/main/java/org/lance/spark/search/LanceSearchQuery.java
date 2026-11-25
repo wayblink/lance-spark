@@ -278,6 +278,37 @@ public class LanceSearchQuery implements Serializable {
     return queryCount > 0;
   }
 
+  /**
+   * This batch restricted to {@code count} queries starting at {@code from}, with every other field
+   * unchanged.
+   *
+   * <p>The queries are not renumbered: query {@code from + i} of the result is query {@code from +
+   * i} of this batch, and lance-core's per-scan {@code query_index} is shifted by {@code from} when
+   * the chunk is read. That is what keeps {@code query_id} equal to the input position however the
+   * batch was cut up.
+   */
+  public LanceSearchQuery subBatch(int from, int count) {
+    if (queryCount <= 0) {
+      throw new IllegalStateException(
+          "subBatch() needs a batch search, but this one is a single " + "vector");
+    }
+    if (from < 0 || count <= 0 || (long) from + count > queryCount) {
+      throw new IllegalArgumentException(
+          "queries ["
+              + from
+              + ", "
+              + ((long) from + count)
+              + ") are outside a batch of "
+              + queryCount);
+    }
+    int start = from * vectorDim;
+    int end = (from + count) * vectorDim;
+    return toBuilder()
+        .batch(vectors.subList(start, end), count, vectorDim)
+        .vector(Collections.emptyList())
+        .build();
+  }
+
   public QueryTableRequest toQueryTableRequest() {
     QueryTableRequest request = new QueryTableRequest().id(tableId).k(k);
     request.vector(new QueryTableRequestVector());
@@ -527,6 +558,32 @@ public class LanceSearchQuery implements Serializable {
       }
       this.vectors = flat;
       this.queryCount = queries.size();
+      this.vectorDim = dimension;
+      return this;
+    }
+
+    /**
+     * Sets a batch directly from the flattened {@code queries x dimension} matrix, for a chunk of
+     * an existing batch. The list is copied, so a view such as {@code subList} is safe here.
+     */
+    public Builder batch(List<Float> flat, int queries, int dimension) {
+      if (flat == null || queries <= 0 || dimension <= 0) {
+        throw new IllegalArgumentException(
+            "a batch needs queries * dimension floats, got " + (flat == null ? 0 : flat.size()));
+      }
+      if (flat.size() != (long) queries * dimension) {
+        throw new IllegalArgumentException(
+            "a batch of "
+                + queries
+                + " queries of dimension "
+                + dimension
+                + " needs "
+                + ((long) queries * dimension)
+                + " floats, got "
+                + flat.size());
+      }
+      this.vectors = new ArrayList<>(flat);
+      this.queryCount = queries;
       this.vectorDim = dimension;
       return this;
     }

@@ -76,6 +76,13 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
    */
   private final LanceSearchVersionPin versionPin;
 
+  /**
+   * How a batch search is cut into native scans, resolved once on the driver so every task cuts it
+   * the same way and an {@code EXPLAIN} can show the division. A single-vector search gets a
+   * one-chunk plan, which the reader takes as "nothing to cut".
+   */
+  private final LanceBatchChunkPlan batchChunkPlan;
+
   private final String scanId = UUID.randomUUID().toString();
   private transient long driverPlanningTimeNs;
   private transient long driverIndexDiscoveryTimeNs;
@@ -98,6 +105,24 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
     this.schema = schema;
     this.query = query;
     this.versionPin = versionPin;
+    this.batchChunkPlan = planBatchChunks(schema, query);
+  }
+
+  /**
+   * The chunk plan of this scan. Pure arithmetic from the batch size, the vector dimension, {@code
+   * k} and the scan's own row width: it needs no dataset, so the description can state it before
+   * planning opens anything.
+   */
+  private static LanceBatchChunkPlan planBatchChunks(StructType schema, LanceSearchQuery query) {
+    if (query == null || !query.isBatch()) {
+      return LanceBatchChunkPlan.singleQuery();
+    }
+    return LanceBatchChunking.plan(
+        query.getQueryCount(),
+        query.getVectorDim(),
+        query.getK() == null ? 0 : query.getK(),
+        LanceBatchChunking.estimatedRowWidth(schema),
+        LanceBatchChunking.fromActiveSession());
   }
 
   @Override
@@ -107,7 +132,10 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
 
   @Override
   public String description() {
-    return "LanceDistributedSearchScan [scanId=" + scanId + "]";
+    if (batchChunkPlan.isSingleChunk() && !query.isBatch()) {
+      return "LanceDistributedSearchScan [scanId=" + scanId + "]";
+    }
+    return "LanceDistributedSearchScan [scanId=" + scanId + ", " + batchChunkPlan.describe() + "]";
   }
 
   @Override
@@ -309,6 +337,7 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
           planUnits(indexedQuery, resolvedQuery, liveSegments, fallbackFragments);
 
       long indexedCount = units.stream().filter(u -> !u.getIndexSegments().isEmpty()).count();
+      logBatchChunking(resolvedQuery, units.size(), indexedCount);
       LOG.info(
           "Lance distributed vector search: scanId={}, column={}, indexName={}, units={} "
               + "(indexed={}, fallback={}), candidateK={}",
@@ -335,14 +364,66 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
     for (UUID segmentUuid : liveSegments) {
       units.add(
           LanceDistributedSearchInputPartition.forIndexSegment(
-              schema, indexedQuery, segmentUuid, scanId));
+              schema, indexedQuery, segmentUuid, batchChunkPlan, scanId));
     }
     for (Integer fragmentId : fallbackFragments) {
       units.add(
           LanceDistributedSearchInputPartition.forFragment(
-              schema, fallbackQuery, fragmentId, scanId));
+              schema, fallbackQuery, fragmentId, batchChunkPlan, scanId));
     }
     return units;
+  }
+
+  /**
+   * States how the batch is cut, and the two numbers a reader of the log needs to judge it: the
+   * worst-case rows in flight (`units x chunkQueries x k`) and the query matrix, which chunking
+   * cannot shrink because every task needs every query vector.
+   */
+  private void logBatchChunking(LanceSearchQuery scanQuery, int units, long indexedUnits) {
+    if (!scanQuery.isBatch()) {
+      return;
+    }
+    long k = scanQuery.getK() == null ? 0 : scanQuery.getK();
+    long rowsInFlight = units * (long) batchChunkPlan.chunkQueries() * k;
+    LOG.info(
+        "Lance distributed batch search: scanId={}, {}, units={} (indexed={}, fallback={}), "
+            + "worstCaseRowsInFlight={}",
+        scanId,
+        batchChunkPlan.describe(),
+        units,
+        indexedUnits,
+        units - indexedUnits,
+        rowsInFlight);
+    if (!batchChunkPlan.isSingleChunk()) {
+      LOG.info(
+          "Lance distributed batch search chunking: scanId={}, queriesPerNativeScan={}, "
+              + "nativeScansPerTask={}, estimatedBytesPerNativeScan={}",
+          scanId,
+          batchChunkPlan.chunkQueries(),
+          batchChunkPlan.chunks(),
+          batchChunkPlan.estimatedBytesPerChunk());
+    }
+    if (batchChunkPlan.exceededBudget()) {
+      LOG.warn(
+          "Lance distributed batch search: scanId={}, {} queries per native scan is above "
+              + "{} because {} is {}; chunking cannot make a chunk smaller than that floor, so "
+              + "the working set per scan is about {} bytes",
+          scanId,
+          batchChunkPlan.chunkQueries(),
+          LanceBatchChunking.BudgetBytesConf(),
+          LanceBatchChunking.MinQueriesConf(),
+          batchChunkPlan.perQueryBytes(),
+          batchChunkPlan.estimatedBytesPerChunk());
+    }
+    if (!batchChunkPlan.isSingleChunk()
+        && batchChunkPlan.estimatedMatrixBytes() > batchChunkPlan.estimatedBytesPerChunk()) {
+      // Chunking bounds one scan, never the query matrix: each task receives all N vectors.
+      LOG.info(
+          "Lance distributed batch search: scanId={}, queryMatrixBytes={} is carried whole by "
+              + "every task; only the per-scan working set is chunked",
+          scanId,
+          batchChunkPlan.estimatedMatrixBytes());
+    }
   }
 
   private String resolveVectorColumn() {

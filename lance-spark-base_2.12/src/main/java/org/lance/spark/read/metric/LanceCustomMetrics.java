@@ -51,6 +51,10 @@ public final class LanceCustomMetrics {
   public static final String NUM_INDEX_CACHE_HITS = "numIndexCacheHits";
   public static final String NUM_INDEX_CACHE_MISSES = "numIndexCacheMisses";
 
+  public static final String NUM_BATCH_CHUNKS = "numBatchChunks";
+  public static final String NUM_BATCH_CHUNK_QUERIES = "numBatchChunkQueries";
+  public static final String NUM_BATCH_CHUNK_BYTES = "numBatchChunkBytes";
+
   public static final String DATASET_OPEN_TIME_NS = "datasetOpenTimeNs";
   public static final String SCANNER_CREATE_TIME_NS = "scannerCreateTimeNs";
   public static final String BATCH_LOAD_TIME_NS = "batchLoadTimeNs";
@@ -193,6 +197,42 @@ public final class LanceCustomMetrics {
     }
   }
 
+  public static class NumBatchChunksMetric extends CustomSumMetric {
+    @Override
+    public String name() {
+      return NUM_BATCH_CHUNKS;
+    }
+
+    @Override
+    public String description() {
+      return "number of native scans a batch search was split into (0 for a single-query search)";
+    }
+  }
+
+  public static class NumBatchChunkQueriesMetric extends CustomSumMetric {
+    @Override
+    public String name() {
+      return NUM_BATCH_CHUNK_QUERIES;
+    }
+
+    @Override
+    public String description() {
+      return "number of batch queries submitted to native scans (0 for a single-query search)";
+    }
+  }
+
+  public static class NumBatchChunkBytesMetric extends CustomSumMetric {
+    @Override
+    public String name() {
+      return NUM_BATCH_CHUNK_BYTES;
+    }
+
+    @Override
+    public String description() {
+      return "estimated bytes of batch queries and their result rows submitted to native scans";
+    }
+  }
+
   public static class DatasetOpenTimeNsMetric extends CustomNsTimeMetric {
     @Override
     public String name() {
@@ -270,11 +310,26 @@ public final class LanceCustomMetrics {
     new BatchLoadTimeNsMetric(),
   };
 
-  /** Search-only driver timings are never emitted by a task reader. */
+  private static final CustomMetric[] BATCH_SEARCH_METRICS = {
+    new NumBatchChunksMetric(), new NumBatchChunkQueriesMetric(), new NumBatchChunkBytesMetric(),
+  };
+
+  /**
+   * Search-only metrics: the driver timings are never emitted by a task reader, the batch-chunk
+   * counters are never emitted by the read path, and the read path must not declare counters it
+   * cannot report.
+   */
   public static CustomMetric[] distributedSearchMetrics() {
-    CustomMetric[] metrics = Arrays.copyOf(ALL_METRICS, ALL_METRICS.length + 2);
-    metrics[ALL_METRICS.length] = new DriverPlanningTimeNsMetric();
-    metrics[ALL_METRICS.length + 1] = new DriverIndexDiscoveryTimeNsMetric();
+    CustomMetric[] metrics =
+        Arrays.copyOf(ALL_METRICS, ALL_METRICS.length + 2 + BATCH_SEARCH_METRICS.length);
+    // Appended after the copied array: overwriting from index 0 would leave the tail null, and
+    // DataSourceV2ScanExecBase fails the query on a null metric.
+    int next = ALL_METRICS.length;
+    metrics[next++] = new DriverPlanningTimeNsMetric();
+    metrics[next++] = new DriverIndexDiscoveryTimeNsMetric();
+    for (CustomMetric metric : BATCH_SEARCH_METRICS) {
+      metrics[next++] = metric;
+    }
     return metrics;
   }
 

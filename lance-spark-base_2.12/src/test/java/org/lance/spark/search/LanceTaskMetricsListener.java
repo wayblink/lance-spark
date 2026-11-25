@@ -38,6 +38,9 @@ class LanceTaskMetricsListener extends SparkListener {
     for (CustomMetric metric : LanceCustomMetrics.allMetrics()) {
       DESC_TO_NAME.put(metric.description(), metric.name());
     }
+    for (CustomMetric metric : LanceCustomMetrics.distributedSearchMetrics()) {
+      DESC_TO_NAME.put(metric.description(), metric.name());
+    }
   }
 
   private final Map<String, Long> metricValues = new ConcurrentHashMap<>();

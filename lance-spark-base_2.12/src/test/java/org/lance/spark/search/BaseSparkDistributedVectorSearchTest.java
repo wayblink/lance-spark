@@ -466,6 +466,300 @@ public abstract class BaseSparkDistributedVectorSearchTest {
     return null;
   }
 
+  // ------------------------------------------------- query_id and batch chunking
+
+  /**
+   * The contract a chunked batch rests on: `query_id` is the query's position in the input
+   * sequence, so a business id column only decides the order and never becomes the id. NULLs and
+   * duplicates stay legal - they make the order among themselves unspecified, which is why the
+   * assertion is a bijection rather than a fixed mapping.
+   */
+  @Test
+  void batchQueryIdsAreInputPositionsNotBusinessIds() {
+    String table = createFiveFragmentTable();
+    String queries = CATALOG_NAME + ".default.chunk_queries";
+    spark.sql("DROP TABLE IF EXISTS " + queries + " PURGE");
+    // The id column is nullable on purpose: a batch whose ordering column has NULLs must still
+    // number its queries 0..N-1. Rows are inserted in reverse id order so insert order cannot
+    // explain the numbering.
+    spark.sql(
+        "CREATE TABLE "
+            + queries
+            + " (qid INT, vec ARRAY<FLOAT> NOT NULL) USING lance "
+            + "TBLPROPERTIES ('vec.arrow.fixed-size-list.size' = '4')");
+    spark.sql("INSERT INTO " + queries + " SELECT 3, array(3.0, 3.0, 3.0, 3.0)");
+    spark.sql("INSERT INTO " + queries + " SELECT 1, array(1.0, 1.0, 1.0, 1.0)");
+    spark.sql("INSERT INTO " + queries + " SELECT 1, array(4.0, 4.0, 4.0, 4.0)");
+    spark.sql("INSERT INTO " + queries + " SELECT NULL, array(0.0, 0.0, 0.0, 0.0)");
+
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    List<Row> rows =
+        spark
+            .sql(
+                "SELECT query_id, id, _distance FROM VECTOR_SEARCH(table => '"
+                    + table
+                    + "', query_table => '"
+                    + queries
+                    + "', query_id_column => 'qid', query_vector_column => 'vec', k => 2)"
+                    + " ORDER BY query_id, _distance, id")
+            .collectAsList();
+
+    assertEquals(8, rows.size(), "four queries times k rows");
+    // Spark orders NULLs first ascending, so the NULL-id row is query 0; which of the two qid=1
+    // rows is query 1 and which is 2 is not specified, and this test must not depend on it.
+    for (int query = 0; query < 4; query++) {
+      assertEquals(
+          Integer.valueOf(query),
+          rows.get(query * 2).getInt(0),
+          "query ids must be 0..3 in input order, saw " + rows);
+    }
+    assertEquals(
+        0,
+        rows.get(0).getInt(1),
+        "query 0 is the NULL-id row (array of zeros), whose nearest row is id 0");
+    assertEquals(
+        rankedIdsOf(singleQuerySearch(table, 2, constantVector(0.0))),
+        idsOfQuery(rows, 0),
+        "query 0 must answer what searching its vector alone answers");
+
+    List<List<Integer>> answered = new ArrayList<>();
+    for (int query = 1; query < 4; query++) {
+      answered.add(idsOfQuery(rows, query));
+    }
+    List<List<Integer>> expected = new ArrayList<>();
+    for (double center : new double[] {1.0, 3.0, 4.0}) {
+      expected.add(rankedIdsOf(singleQuerySearch(table, 2, constantVector(center))));
+    }
+    Comparator<List<Integer>> byContents = Comparator.comparing(Object::toString);
+    answered.sort(byContents);
+    expected.sort(byContents);
+    assertEquals(
+        expected,
+        answered,
+        "queries 1..3 must be exactly the three remaining vectors, in some order");
+  }
+
+  /**
+   * A NULL query vector is skipped, and skipping must not renumber the queries after it: a caller
+   * maps `query_id` back to the positions of the rows it kept.
+   */
+  @Test
+  void aNullQueryVectorIsSkippedWithoutShiftingNumbering() {
+    String table = createFiveFragmentTable();
+    String queries = CATALOG_NAME + ".default.null_vec_queries";
+    spark.sql("DROP TABLE IF EXISTS " + queries + " PURGE");
+    spark.sql("CREATE TABLE " + queries + " (qid INT NOT NULL, vec ARRAY<FLOAT>) USING lance");
+    spark.sql("INSERT INTO " + queries + " SELECT 0, array(0.0, 0.0, 0.0, 0.0)");
+    spark.sql("INSERT INTO " + queries + " SELECT 1, NULL");
+    spark.sql("INSERT INTO " + queries + " SELECT 2, array(2.0, 2.0, 2.0, 2.0)");
+
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    List<Row> rows =
+        spark
+            .sql(
+                "SELECT query_id, id FROM VECTOR_SEARCH(table => '"
+                    + table
+                    + "', query_table => '"
+                    + queries
+                    + "', query_id_column => 'qid', query_vector_column => 'vec', k => 1)"
+                    + " ORDER BY query_id")
+            .collectAsList();
+
+    assertEquals(2, rows.size(), "the two non-null queries answer, the null one is skipped");
+    assertEquals(0, rows.get(0).getInt(0), "numbering starts at 0 and stays contiguous");
+    assertEquals(1, rows.get(1).getInt(0), "the row after the skipped query is not renumbered");
+    assertEquals(0, rows.get(0).getInt(1), "query 0 is the zero vector, nearest row is id 0");
+    assertEquals(2, rows.get(1).getInt(1), "query 1 is the 2-vector, nearest row is id 2");
+  }
+
+  /**
+   * The whole point of chunking: a batch cut into several native scans must answer exactly what the
+   * same batch answers in one scan, `query_id` included. A four-query batch over a five-fragment
+   * table needs 224 estimated bytes, so a 112-byte budget forces two queries per scan.
+   */
+  @Test
+  void aChunkedBatchAnswersExactlyWhatAnUnchunkedBatchAnswers() throws Exception {
+    String table = createFiveFragmentTable();
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    String sql =
+        "SELECT query_id, id, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', queries => array('0.0,0.0,0.0,0.0', '1.0,1.0,1.0,1.0', "
+            + "'2.0,2.0,2.0,2.0', '4.0,4.0,4.0,4.0'), k => 2)"
+            + " ORDER BY query_id, _distance, id";
+
+    spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "67108864");
+    List<Row> unchunked = spark.sql(sql).collectAsList();
+
+    LanceTaskMetricsListener listener = new LanceTaskMetricsListener();
+    spark.sparkContext().addSparkListener(listener);
+    spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "112");
+    List<Row> chunked;
+    try {
+      chunked = spark.sql(sql).collectAsList();
+      spark.sparkContext().listenerBus().waitUntilEmpty(5000);
+    } finally {
+      spark.sparkContext().removeSparkListener(listener);
+      spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "67108864");
+    }
+
+    assertEquals(unchunked.size(), chunked.size(), "chunking must not change the row count");
+    for (int row = 0; row < unchunked.size(); row++) {
+      assertEquals(
+          unchunked.get(row).getInt(0), chunked.get(row).getInt(0), "row " + row + " query_id");
+      assertEquals(unchunked.get(row).getInt(1), chunked.get(row).getInt(1), "row " + row + " id");
+      assertEquals(
+          unchunked.get(row).getFloat(2),
+          chunked.get(row).getFloat(2),
+          1e-6f,
+          "row " + row + " _distance");
+    }
+
+    // Five fragments are five units, each of which now runs two native scans instead of one; the
+    // counters are summed over tasks and prove the smaller budget really took effect.
+    Map<String, Long> metrics = listener.metricValues();
+    assertEquals(
+        Long.valueOf(10L),
+        metrics.get(LanceCustomMetrics.NUM_BATCH_CHUNKS),
+        "five units times two chunks, got " + metrics);
+    assertEquals(
+        Long.valueOf(20L),
+        metrics.get(LanceCustomMetrics.NUM_BATCH_CHUNK_QUERIES),
+        "five units times four queries, got " + metrics);
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.NUM_BATCH_CHUNK_BYTES, 0L) > 0L,
+        "the estimated volume must be reported, got " + metrics);
+  }
+
+  /** Each query of a chunked batch must still equal what searching that vector alone answers. */
+  @Test
+  void everyQueryOfAChunkedBatchEqualsItsOwnSingleSearch() {
+    String table = createFiveFragmentTable();
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "112");
+    try {
+      List<Row> rows =
+          spark
+              .sql(
+                  "SELECT query_id, id, _distance FROM VECTOR_SEARCH(table => '"
+                      + table
+                      + "', queries => array('0.0,0.0,0.0,0.0', '1.0,1.0,1.0,1.0', "
+                      + "'2.0,2.0,2.0,2.0', '4.0,4.0,4.0,4.0'), k => 2)"
+                      + " ORDER BY query_id, _distance, id")
+              .collectAsList();
+      double[] centers = {0.0, 1.0, 2.0, 4.0};
+      for (int query = 0; query < centers.length; query++) {
+        assertEquals(
+            rankedIdsOf(singleQuerySearch(table, 2, constantVector(centers[query]))),
+            idsOfQuery(rows, query),
+            "query " + query + " must answer what a single search of its vector answers");
+      }
+    } finally {
+      spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "67108864");
+    }
+  }
+
+  /** A batch of one query is still a batch: one query id, and chunking has nothing to cut. */
+  @Test
+  void aSingleQueryBatchStillCarriesItsQueryId() {
+    String table = createFiveFragmentTable();
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "1");
+    try {
+      List<Row> rows =
+          spark
+              .sql(
+                  "SELECT query_id, id FROM VECTOR_SEARCH(table => '"
+                      + table
+                      + "', queries => array('0.0,0.0,0.0,0.0'), k => 3)"
+                      + " ORDER BY query_id, _distance, id")
+              .collectAsList();
+      assertEquals(3, rows.size(), "one query, k rows");
+      assertEquals(0, rows.get(0).getInt(0));
+      assertEquals(0, rows.get(1).getInt(0));
+    } finally {
+      spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "67108864");
+    }
+  }
+
+  /** k above the number of matching rows returns what exists, per query, without duplicating. */
+  @Test
+  void aChunkedBatchWithKLargerThanTheDataReturnsEachRowOnce() {
+    String table = createFiveFragmentTable();
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "1");
+    try {
+      List<Row> rows =
+          spark
+              .sql(
+                  "SELECT query_id, id FROM VECTOR_SEARCH(table => '"
+                      + table
+                      + "', queries => array('0.0,0.0,0.0,0.0', '9.0,9.0,9.0,9.0'), k => 50)"
+                      + " ORDER BY query_id, _distance, id")
+              .collectAsList();
+      assertEquals(10, rows.size(), "two queries times the five rows that exist");
+      for (int query = 0; query < 2; query++) {
+        assertEquals(5, idsOfQuery(rows, query).size(), "query " + query + " sees every row once");
+      }
+    } finally {
+      spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "67108864");
+    }
+  }
+
+  /** The plan text states the division, so an EXPLAIN shows why a batch opened several scans. */
+  @Test
+  void theScanDescriptionNamesTheChunkDivision() {
+    String table = createFiveFragmentTable();
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "112");
+    try {
+      Dataset<Row> result =
+          spark.sql(
+              "SELECT query_id, id FROM VECTOR_SEARCH(table => '"
+                  + table
+                  + "', queries => array('0.0,0.0,0.0,0.0', '1.0,1.0,1.0,1.0', "
+                  + "'2.0,2.0,2.0,2.0', '4.0,4.0,4.0,4.0'), k => 2)");
+      assertEquals(8, result.collectAsList().size());
+      String description = findSearchScan(result).description();
+      assertTrue(
+          description.contains("chunkQueries=2") && description.contains("chunks=2"),
+          "the scan description must state the division, was: " + description);
+    } finally {
+      spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "67108864");
+    }
+  }
+
+  private String constantVector(double value) {
+    return "array(" + value + ", " + value + ", " + value + ", " + value + ")";
+  }
+
+  /** The ids one query answered, in rank order. */
+  private static List<Integer> idsOfQuery(List<Row> rows, int query) {
+    List<Integer> ids = new ArrayList<>();
+    for (Row row : rows) {
+      if (row.getInt(0) == query) {
+        ids.add(row.getInt(1));
+      }
+    }
+    return ids;
+  }
+
+  /** One query through the same distributed path, used as the reference for a batch member. */
+  private String singleQuerySearch(String table, int k, String queryVectorSql) {
+    return "SELECT id FROM VECTOR_SEARCH(table => '"
+        + table
+        + "', query_vector => "
+        + queryVectorSql
+        + ", k => "
+        + k
+        + ") ORDER BY _distance, id";
+  }
+
+  /** The ids a single-search SQL returns, in rank order (the SQL already orders them). */
+  private List<Integer> rankedIdsOf(String sql) {
+    return idsOf(sql);
+  }
+
   private List<Integer> idsOf(String sql) {
     List<Integer> ids = new ArrayList<>();
     for (Row row : spark.sql(sql).collectAsList()) {

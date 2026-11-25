@@ -25,6 +25,11 @@ import java.util.UUID;
  * One unit of a distributed search, run by one Spark task: either a single segment of a vector
  * index, or a single fragment the index does not cover. The two are mutually exclusive by
  * construction - use {@link #forIndexSegment} or {@link #forFragment}.
+ *
+ * <p>A unit of a batch search also carries the chunk plan the driver resolved, so every task cuts
+ * the batch the same way and the per-task counters agree with the plan an {@code EXPLAIN} shows.
+ * The task opens the dataset once and runs one native scan per chunk, which keeps the working set
+ * bounded without opening the dataset and its index once per chunk.
  */
 public class LanceDistributedSearchInputPartition implements InputPartition {
   private static final long serialVersionUID = -70163928476152093L;
@@ -33,6 +38,7 @@ public class LanceDistributedSearchInputPartition implements InputPartition {
   private final LanceSearchQuery query;
   private final List<Integer> fragmentIds;
   private final List<UUID> indexSegments;
+  private final LanceBatchChunkPlan batchChunkPlan;
 
   /**
    * The planning scan's tracing id, carried along so an executor log line can be tied back to the
@@ -46,30 +52,46 @@ public class LanceDistributedSearchInputPartition implements InputPartition {
       LanceSearchQuery query,
       List<Integer> fragmentIds,
       List<UUID> indexSegments,
+      LanceBatchChunkPlan batchChunkPlan,
       String scanId) {
     this.schema = schema;
     this.query = query;
     this.fragmentIds = fragmentIds;
     this.indexSegments = indexSegments;
+    this.batchChunkPlan = batchChunkPlan;
     this.scanId = scanId;
   }
 
   /** An indexed unit: search one segment of a vector index through {@code indexSegments(...)}. */
   public static LanceDistributedSearchInputPartition forIndexSegment(
-      StructType schema, LanceSearchQuery query, UUID segmentUuid, String scanId) {
+      StructType schema,
+      LanceSearchQuery query,
+      UUID segmentUuid,
+      LanceBatchChunkPlan batchChunkPlan,
+      String scanId) {
     return new LanceDistributedSearchInputPartition(
         schema,
         query,
         Collections.emptyList(),
         Collections.singletonList(Objects.requireNonNull(segmentUuid, "segmentUuid")),
+        Objects.requireNonNull(batchChunkPlan, "batchChunkPlan"),
         scanId);
   }
 
   /** A fallback unit: flat KNN over one fragment no index segment covers. */
   public static LanceDistributedSearchInputPartition forFragment(
-      StructType schema, LanceSearchQuery query, int fragmentId, String scanId) {
+      StructType schema,
+      LanceSearchQuery query,
+      int fragmentId,
+      LanceBatchChunkPlan batchChunkPlan,
+      String scanId) {
     return new LanceDistributedSearchInputPartition(
-        schema, query, Collections.singletonList(fragmentId), Collections.emptyList(), scanId);
+        schema,
+        query,
+        Collections.singletonList(fragmentId),
+        Collections.emptyList(),
+        Objects.requireNonNull(batchChunkPlan, "batchChunkPlan"),
+        scanId);
   }
 
   public StructType getSchema() {
@@ -86,6 +108,14 @@ public class LanceDistributedSearchInputPartition implements InputPartition {
 
   public List<UUID> getIndexSegments() {
     return indexSegments;
+  }
+
+  /**
+   * How this unit cuts a batch into native scans, resolved on the driver. Never null: a
+   * single-vector search carries a one-chunk plan that the reader takes as "nothing to cut".
+   */
+  public LanceBatchChunkPlan getBatchChunkPlan() {
+    return batchChunkPlan;
   }
 
   /** The planning scan's tracing id, for correlating executor logs with the driver's. */

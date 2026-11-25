@@ -258,14 +258,6 @@ public class LanceSearchQuery implements Serializable {
     return fullTextQueryJson;
   }
 
-  boolean isVectorSearch() {
-    return searchType == SearchType.VECTOR;
-  }
-
-  boolean isFullTextSearch() {
-    return searchType == SearchType.FULL_TEXT;
-  }
-
   /** Flattened batch of query vectors; empty when this is a single-vector search. */
   public List<Float> getVectors() {
     return vectors;

@@ -32,7 +32,22 @@ Run vector similarity search from Spark SQL using Lance namespace execution.
     ORDER BY _distance;
     ```
 
-## Positional Form
+## Column projection
+
+`VECTOR_SEARCH` propagates the columns required by the outer Spark query to the Lance search scan. For example, the following query asks the native scan for `id` and the generated distance only; it does not need to materialize unrelated table columns:
+
+```sql
+SELECT id, _distance
+FROM VECTOR_SEARCH(
+    table => 'lance.default.items',
+    query_vector => array(0.12, 0.34, 0.56, 0.78),
+    num_results => 10
+)
+ORDER BY _distance;
+```
+
+`SELECT *` keeps the full table projection. An explicit `columns => array(...)` remains authoritative and is recommended when the required output is known. Generated search fields such as `_distance`, `_score`, and the distributed tie-breaking `_rowid` remain available to the search plan; a projection containing only metadata fields may conservatively keep the original native projection to preserve Lance's empty-column semantics. Nested struct reads keep the full struct layout internally so Arrow child-field positions stay aligned.
+
 
 Use positional arguments for simple calls and Spark 3.4 compatibility.
 

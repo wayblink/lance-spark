@@ -13,6 +13,8 @@
  */
 package org.lance.spark.search;
 
+import org.lance.spark.read.ReadSchemaNestedStructWidening;
+
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.types.StructType;
@@ -28,8 +30,9 @@ public class LanceSearchScanBuilder implements SupportsPushDownRequiredColumns {
 
   @Override
   public void pruneColumns(StructType requiredSchema) {
-    schema = requiredSchema;
-    query = LanceSearchProjection.prune(query, requiredSchema);
+    StructType widened = ReadSchemaNestedStructWidening.widenRequiredSchema(requiredSchema, schema);
+    schema = widened;
+    query = LanceSearchProjection.prune(query, widened);
   }
 
   @Override

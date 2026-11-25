@@ -36,7 +36,7 @@ import java.util.Map;
  * indexes Arrow children by full struct ordinal. Replacing pruned nested structs with the table's
  * full struct definition restores ordinal agreement between Catalyst and Arrow.
  */
-final class ReadSchemaNestedStructWidening {
+public final class ReadSchemaNestedStructWidening {
 
   private ReadSchemaNestedStructWidening() {}
 
@@ -82,7 +82,7 @@ final class ReadSchemaNestedStructWidening {
     }
   }
 
-  static StructType widenRequiredSchema(StructType required, StructType tableFull) {
+  public static StructType widenRequiredSchema(StructType required, StructType tableFull) {
     if (required == null || tableFull == null) {
       return required;
     }

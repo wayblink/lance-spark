@@ -1,0 +1,47 @@
+{
+  "88a70d83-7749-4419-b25c-8b8d00f855e7": {
+    "app": "spark-5f8d1b1cfad54df287e373107025dc9d",
+    "name": "tpcds100g-lance-gen-smoke-call-center-20260416d-b967729d947eba36-driver",
+    "spark_context_stopped": true,
+    "ui_connection_refused": true,
+    "executors_at_verification": 0,
+    "verified_at_ms": 1795587159000,
+    "evidence": "logs: '26/04/16 04:14:22 INFO SparkContext: Successfully stopped SparkContext' followed by Job aborted stage failure; /api/v1/applications via pod proxy refused (connection refused); zero live executor pods for this app"
+  },
+  "f3eff65d-ad61-4241-8011-4be0ceaf4de8": {
+    "app": "spark-14e44f5b7d7b400b975d57afc57f7394",
+    "name": "tpcds100g-run-lance-benchmark-q1-20260416f-b84bab9d94cf36dd-driver",
+    "spark_context_stopped": true,
+    "ui_connection_refused": true,
+    "executors_at_verification": 0,
+    "verified_at_ms": 1795587159000,
+    "evidence": "logs: '26/04/16 05:42:33 INFO SparkContext: Successfully stopped SparkContext' with executor shutdown sequence; UI proxy refused; zero live executor pods"
+  },
+  "9da133e7-98df-43ea-b815-c41937c196b4": {
+    "app": "spark-8a1db57caa3f488f87845b865518448d",
+    "name": "tpcds100g-lance-file-smoke-call-center-20260416b-ba38049d94859c79-driver",
+    "spark_context_stopped": true,
+    "ui_connection_refused": true,
+    "executors_at_verification": 0,
+    "verified_at_ms": 1795587159000,
+    "evidence": "logs: '26/04/16 04:22:16 INFO SparkContext: Successfully stopped SparkContext' with executor shutdown sequence; UI proxy refused; zero live executor pods"
+  },
+  "0a730c71-eb7c-4cbe-bf8d-df9dafbc05d3": {
+    "app": "spark-82897922288f46a6933b6a168e5a1a2f",
+    "name": "tpcds100g-run-lance-benchmark-q1-20260416e-f7f70e9d94c3b45f-driver",
+    "spark_context_stopped": true,
+    "ui_connection_refused": true,
+    "executors_at_verification": 0,
+    "verified_at_ms": 1795587159000,
+    "evidence": "logs: '26/04/16 05:29:34 INFO SparkContext: Successfully stopped SparkContext' followed by IllegalArgumentException bad query filter; UI proxy refused; zero live executor pods"
+  },
+  "75f52055-f717-46b4-b225-d5805f2885bf": {
+    "app": "spark-944b7c16f5a34651ab31986e26830e21",
+    "name": "tpcds100g-lance-gen-20260416e-3027059d949827c3-driver",
+    "spark_context_stopped": true,
+    "ui_connection_refused": true,
+    "executors_at_verification": 0,
+    "verified_at_ms": 1795587159000,
+    "evidence": "logs: '26/04/16 04:49:20 INFO SparkContext: Successfully stopped SparkContext' with executor shutdown sequence; UI proxy refused; zero live executor pods"
+  }
+}

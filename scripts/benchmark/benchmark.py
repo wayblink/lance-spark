@@ -29,12 +29,15 @@ def main():
     p.add_argument("--run", action="store_true", help="explicit approved cluster mode; dry-run is default")
     p.add_argument("--approved", action="store_true")
     p.add_argument("--window-seconds", type=int, default=1800)
+    p.add_argument("--stopped-evidence", type=Path,
+                   help="UID-fenced JSON of drivers verified stopped before the run")
     a=p.parse_args();c=json.loads(a.contract.read_text())
     if a.run:
         if not a.approved:
             p.error("--run requires --approved after root code review and user authorization")
         import submit
-        submit.run_matrix(c, a.contract, Path(a.queries), Path(a.truth), Path(a.output_root), a.window_seconds)
+        submit.run_matrix(c, a.contract, Path(a.queries), Path(a.truth), Path(a.output_root),
+                          a.window_seconds, a.stopped_evidence)
         return
     print(json.dumps({"status":"MATRIX_PREPARED_NOT_SUBMITTED", "source":"BaselineBenchmark.java",
                       "contract_sha256":baseline.sha256(a.contract),"spark_conf":baseline.spark_conf(c),

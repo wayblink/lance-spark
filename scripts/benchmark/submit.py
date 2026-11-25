@@ -14,6 +14,10 @@ import pilot
 
 POLL_SECONDS = 20
 
+# Driver UIDs whose own evidence proves SparkContext stopped and no executor remains.
+# This is an explicit, UID-fenced allowlist; a replacement pod or any executor revokes it.
+VERIFIED_STOPPED_DRIVERS = {}
+
 # Names/arguments used by long-lived Spark services must not block a benchmark window.
 BACKGROUND_TOKENS = (
     "kyuubi", "thrift", "thriftserver", "connect", "spark-connect-server",
@@ -54,8 +58,14 @@ def activity_details(pods, own_app=None, own_name=None):
             continue
         text = _pod_text(pod)
         key = app or f"pod:{meta.get('uid') or meta.get('name')}"
+        category = (
+            "stopped"
+            if role == "driver"
+            and VERIFIED_STOPPED_DRIVERS.get(meta.get("uid"), {}).get("app") == app
+            else None
+        )
         app_evidence.setdefault(key, []).append(text)
-        live.append((pod, role, app, key))
+        live.append((pod, role, app, key, category))
 
     app_category = {}
     for key, texts in app_evidence.items():
@@ -67,15 +77,31 @@ def activity_details(pods, own_app=None, own_name=None):
         else:
             app_category[key] = "unknown"
 
+    revoked_apps = {
+        app
+        for pod, role, app, key, verified_category in live
+        if role == "executor"
+        and app
+        and any(
+            p_role == "driver"
+            and p_app == app
+            and verified == "stopped"
+            for _pod, p_role, p_app, _key, verified in live
+        )
+    }
     out = []
-    for pod, role, app, key in live:
+    for pod, role, app, key, verified_category in live:
         meta, status = pod.get("metadata", {}), pod.get("status", {})
         if (own_app and app == own_app) or meta.get("name") == own_name:
             continue
+        category = verified_category or app_category[key]
+        # Any live executor under an allowlisted old application invalidates its exemption.
+        if app in revoked_apps:
+            category = "benchmark"
         out.append({"uid": meta.get("uid"), "name": meta.get("name"), "app": app,
                     "role": role, "phase": status.get("phase"),
                     "node": pod.get("spec", {}).get("nodeName"),
-                    "category": app_category[key]})
+                    "category": category})
     return out
 
 
@@ -87,7 +113,7 @@ def activity(pods, own_app=None, own_name=None):
 
 def schedule():
     # Freeze this setting for the whole matrix; executors retain normal scheduler placement.
-    return {"spark.kubernetes.driver.node.selector.kubernetes.io/hostname": "cpu-1122.host.platform.basemind.com"}
+    return {"spark.kubernetes.driver.node.selector.kubernetes.io/hostname": "cpu-1122.host.platform.shaipower.com"}
 
 
 def delete_options(uid):
@@ -296,8 +322,25 @@ def run_cell(c, kind, k, jar, remote_contract, remote_truth, root, remote_root, 
     return records
 
 
-def run_matrix(c,contract_path,queries_path,truth_path,output,window_seconds=1800):
-    os.umask(0o077);baseline.validate_contract(c);baseline.validate_asset_files(c,queries_path,truth_path)
+def load_stopped_evidence(path):
+    """Load the UID-fenced evidence map for drivers proven to have stopped."""
+    evidence=json.loads(Path(path).read_text())
+    baseline.require(isinstance(evidence,dict),"stopped-driver evidence must be a UID map")
+    for uid,record in evidence.items():
+        baseline.require(uid and isinstance(record,dict) and record.get("app")
+                         and record.get("spark_context_stopped") is True
+                         and record.get("ui_connection_refused") is True
+                         and record.get("executors_at_verification")==0
+                         and record.get("verified_at_ms"),"incomplete stopped-driver evidence")
+    return evidence
+
+
+def run_matrix(c,contract_path,queries_path,truth_path,output,window_seconds=1800,stopped_evidence=None):
+    os.umask(0o077)
+    VERIFIED_STOPPED_DRIVERS.clear()
+    if stopped_evidence is not None:
+        VERIFIED_STOPPED_DRIVERS.update(load_stopped_evidence(stopped_evidence))
+    baseline.validate_contract(c);baseline.validate_asset_files(c,queries_path,truth_path)
     baseline.require(baseline.query_float32_sha256([json.loads(l) for l in Path(queries_path).read_text().splitlines() if l.strip()])==c["query_float32_sha256"],"frozen queries changed")
     output=Path(output).resolve();output.mkdir(parents=True,exist_ok=False)
     runid="matrix-"+datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")+"-"+uuid.uuid4().hex[:8]
@@ -305,7 +348,9 @@ def run_matrix(c,contract_path,queries_path,truth_path,output,window_seconds=180
     storage,secrets=platform_config();hdfs=os.environ.get("HADOOP_HOME","/opt/hadoop-3.3.1")+"/bin/hdfs"
     store(output,"manifest.json",{"run_id":runid,"contract_sha256":baseline.sha256(contract_path),"truth_sha256":baseline.sha256(truth_path),
                                  "query_json_sha256":baseline.sha256(queries_path),"schedule":schedule(),"executor_schedule":"default, all nodes observed",
-                                 "cells":baseline.cells(c),"remote":remote,"status":"STARTING"},secrets)
+                                 "cells":baseline.cells(c),"remote":remote,"status":"STARTING",
+                                  "window_policy":"exclude active benchmark and unknown apps; record shared background",
+                                  "verified_stopped_drivers":VERIFIED_STOPPED_DRIVERS},secrets)
     src=Path(__file__).with_name("BaselineBenchmark.java");build=output/"build";build.mkdir();(build/"classes").mkdir()
     image=c["image"]+"@"+c["image_digest"]
     compiled=pilot.call(["docker","run","--rm","--user","0","--entrypoint","/bin/bash","-v",str(src)+":/src/BaselineBenchmark.java:ro",

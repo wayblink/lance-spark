@@ -11,6 +11,13 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 
+# Optional sixth cell: text BM25 k=10 (frozen by scripts/benchmark/text-10m.json). The five vector
+# cells above stay untouched; this cell is appended only when the runner is asked for it.
+TEXT_CELLS = (("text", 10),)
+TEXT_QUERIES = 20
+TEXT_K = 10
+TEXT_CONTRACT_NAME = "text-10m.json"
+
 
 def require(ok, message):
     if not ok:
@@ -68,6 +75,88 @@ def sql(c, kind, k, vector=None, diagnostic=False):
     return f"SELECT {columns} FROM VECTOR_SEARCH(" + ", ".join(parts) + ")"
 
 
+def expected_text_sql_template(c):
+    """The one SQL shape the text cell is allowed to execute (``{query}`` is substituted)."""
+    require(isinstance(c, dict), "text contract must be a JSON object")
+    return ("SELECT %s, `%s` FROM %s WHERE lance_match(%s, '{query}') "
+            "ORDER BY `%s` DESC LIMIT %d" % (
+                c.get("id_column"), c.get("score_column"), c.get("table"),
+                c.get("column"), c.get("score_column"), int(c.get("k", 0))))
+
+
+def validate_text_contract(c):
+    """Validate the optional text-cell contract; the five vector cells are not involved."""
+    require(c.get("schema_version") == 1, "unsupported text contract version")
+    require(c.get("kind") == "text" and c.get("k") == TEXT_K, "text cell is k=%d" % TEXT_K)
+    require(c.get("table") == "lance.smoke.mm_fixed" and c.get("column") == "content",
+            "text table/column changed")
+    require(c.get("id_column") == "doc_uuid" and c.get("score_column") == "_score",
+            "text result columns changed")
+    require(c.get("index") == "fmt_fts_content" and c.get("index_segments") == 48,
+            "text FTS index identity changed")
+    require(c.get("version") == 56 and c.get("rows") == 10784907, "10M snapshot changed")
+    require(c.get("queries") == TEXT_QUERIES and c.get("warmup_passes") == 1
+            and c.get("repeats") == 3, "text cell needs 20 queries, 1 warmup and 3 repeats")
+    asset = c.get("queries_asset")
+    require(isinstance(asset, str) and asset == Path(asset).name and asset.endswith(".jsonl")
+            and "/" not in asset and "\\" not in asset, "queries_asset must be a bare .jsonl name")
+    require(re.fullmatch(r"[0-9a-f]{64}", str(c.get("queries_sha256"))) is not None,
+            "queries_sha256 must be 64 lowercase hex")
+    require(c.get("sql_template") == expected_text_sql_template(c), "sql template shape changed")
+    require(re.findall(r"\{[A-Za-z_]+\}", str(c.get("sql_template"))) == ["{query}"],
+            "sql template must contain exactly one {query} placeholder")
+    require(c.get("result_columns") == [c.get("id_column"), c.get("score_column")],
+            "text result contract changed")
+    timeouts = c.get("timeouts") or {}
+    require(isinstance(timeouts.get("action_seconds"), int) and timeouts["action_seconds"] > 0,
+            "text action timeout missing")
+    return c
+
+
+def load_text_asset(c, contract_path):
+    """Read the frozen query asset next to the text contract and check its bytes."""
+    path = Path(contract_path).resolve().parent / c["queries_asset"]
+    require(path.is_file(), "text query asset not found: %s" % path)
+    data = path.read_bytes()
+    require(hashlib.sha256(data).hexdigest() == c["queries_sha256"],
+            "text query asset changed: %s" % path)
+    rows = []
+    for number, line in enumerate(data.decode("utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            raise ValueError("%s:%d: invalid JSON line (%s)" % (path, number, exc))
+        require(isinstance(row, dict) and set(row) == {"qid", "query"},
+                "%s:%d: expected exactly qid+query" % (path, number))
+        require(isinstance(row["qid"], int) and not isinstance(row["qid"], bool),
+                "%s:%d: qid must be an int" % (path, number))
+        require(isinstance(row["query"], str) and row["query"] == row["query"].strip()
+                and row["query"], "%s:%d: query must be a non-empty trimmed string" % (path, number))
+        rows.append(row)
+    require(len(rows) == c["queries"], "%s: expected %d query lines" % (path, c["queries"]))
+    require([row["qid"] for row in rows] == list(range(c["queries"])),
+            "%s: qids must appear in file order as 0..%d" % (path, c["queries"] - 1))
+    require(len({row["query"] for row in rows}) == c["queries"], "%s: duplicate query" % path)
+    return rows
+
+
+def text_sql(c, query):
+    """The executed SQL for one frozen query: only ``{query}`` is substituted, quotes doubled."""
+    require(isinstance(query, str) and query and query == query.strip() and "\n" not in query,
+            "invalid text query")
+    return c["sql_template"].replace("{query}", query.replace("'", "''"))
+
+
+def text_expected_samples(c):
+    return c["queries"] * (c["warmup_passes"] + c["repeats"])
+
+
+def text_cells():
+    return list(TEXT_CELLS)
+
+
 def query_float32_sha256(queries):
     """Hash qid-sorted little-endian int64 id, int32 dimension, IEEE754 float32 payload."""
     h = hashlib.sha256()
@@ -120,11 +209,13 @@ def validate_rows(rows, queries, k):
 def validate_run(records, eventlog_present):
     """Validate warmup/repeats per cell/query; unknown native residency stays unknown."""
     require(eventlog_present, "Spark event log missing")
+    allowed = [("single", 10), ("single", 100), ("single", 2000), ("batch", 100),
+               ("batch", 2000)] + text_cells()
     warmed = set(); observed = {}; diagnostics = []
     for rec in records:
         require(rec.get("complete") is True, "failed/cancelled sample")
         kind, k, qid = rec.get("kind"), rec.get("k"), rec.get("qid", "batch")
-        require((kind, k) in [("single", 10), ("single", 100), ("single", 2000), ("batch", 100), ("batch", 2000)], "invalid cell identity")
+        require((kind, k) in allowed, "invalid cell identity")
         identity = (kind, k, qid)
         if rec.get("warmup"):
             warmed.add(identity)
@@ -138,7 +229,8 @@ def validate_run(records, eventlog_present):
             diagnostics.append(evidence)
     require(observed and all(x == {0, 1, 2} for x in observed.values()), "three fixed repeats per query required")
     for kind, k in {(x[0], x[1]) for x in observed}:
-        expected = set(range(10)) if kind == "single" else {"batch"}
+        expected = (set(range(10)) if kind == "single"
+                    else set(range(TEXT_QUERIES)) if kind == "text" else {"batch"})
         require({x[2] for x in observed if x[:2] == (kind, k)} == expected, "missing measured queries")
     # ScanStats currently lacks index-cache fields in b102cc7's Spark mapping. A driver SDK probe
     # is not evidence for executor SQL sessions. Never fabricate full-residency entries/coverage.
@@ -148,10 +240,13 @@ def validate_run(records, eventlog_present):
             "samples": sum(map(len, observed.values()))}
 
 
-def validate_matrix(records, eventlog_present):
-    require({(x.get("kind"), x.get("k")) for x in records} ==
-            {("single", 10), ("single", 100), ("single", 2000), ("batch", 100), ("batch", 2000)},
-            "full baseline requires exactly five fixed cells")
+def validate_matrix(records, eventlog_present, text=False):
+    required = {("single", 10), ("single", 100), ("single", 2000), ("batch", 100), ("batch", 2000)}
+    if text:
+        required |= set(text_cells())
+    require({(x.get("kind"), x.get("k")) for x in records} == required,
+            "full baseline requires exactly five fixed cells" if not text
+            else "text matrix requires the five fixed cells plus text-k10")
     return validate_run(records, eventlog_present)
 
 
@@ -216,8 +311,9 @@ def spark_conf(c):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("command", choices=["dry-run", "validate-assets"])
+    p.add_argument("command", choices=["dry-run", "validate-assets", "validate-text-assets"])
     p.add_argument("--contract", type=Path, default=HERE / "baseline-10m.json")
+    p.add_argument("--text-contract", type=Path, default=HERE / TEXT_CONTRACT_NAME)
     p.add_argument("--queries", type=Path)
     p.add_argument("--truth", type=Path)
     a = p.parse_args(); c = json.loads(a.contract.read_text()); validate_contract(c)
@@ -225,6 +321,14 @@ def main():
         require(a.queries and a.truth, "--queries and --truth required")
         validate_asset_files(c, a.queries, a.truth)
         print("ASSETS_OK")
+        return
+    if a.command == "validate-text-assets":
+        require(a.text_contract.is_file(), "text contract not found: %s" % a.text_contract)
+        text = validate_text_contract(json.loads(a.text_contract.read_text()))
+        rows = load_text_asset(text, a.text_contract)
+        print(json.dumps({"status": "TEXT_ASSETS_OK", "contract_sha256": sha256(a.text_contract),
+                          "queries_sha256": text["queries_sha256"], "queries": len(rows),
+                          "k": text["k"], "sql_template": text["sql_template"]}, indent=2))
         return
     placeholder = [0.0] * c["dimension"]
     print(json.dumps({"status": "DRY_RUN_ONLY", "requires_approval": ["compile/smoke", "truth", "five cells"],

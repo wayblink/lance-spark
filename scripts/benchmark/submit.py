@@ -289,9 +289,13 @@ def store(output, name, data, secrets):
     (output/name).write_text(pilot.redact(data, secrets))
 
 
-def validate_expected_cell(records, kind, k, eventlog):
+def validate_expected_cell(records, kind, k, eventlog, text_contract=None):
     baseline.require(records and all(x.get("kind")==kind and x.get("k")==k for x in records), "samples belong to a different cell")
-    expected=40 if kind=="single" else 4
+    if kind=="text":
+        baseline.require(text_contract is not None,"text cell has no frozen contract")
+        expected=baseline.text_expected_samples(text_contract)
+    else:
+        expected=40 if kind=="single" else 4
     baseline.require(len(records)==expected,"wrong cell sample/warmup count")
     return baseline.validate_run(records,eventlog)
 
@@ -352,17 +356,62 @@ def placeholder_storage():
     return conf
 
 
-def cell_command(c, kind, k, jar, remote_contract, remote_truth, remote, name, storage):
-    """Build the reviewed spark-submit invocation for one cell (pure: no cluster access)."""
+def _cell_conf(c, name, remote, storage):
+    """Shared driver/executor conf for one cell; identical for the five vector cells and text."""
     conf=baseline.spark_conf(c);conf.update(schedule());conf.update(storage)
     conf.update({"spark.kubernetes.driver.pod.name":name,"spark.kubernetes.driver.deleteOnTermination":"false",
                  "spark.kubernetes.submission.waitAppCompletion":"false","spark.eventLog.dir":remote+"/spark-events",
                  "spark.driver.maxResultSize":"1g"})
+    return conf
+
+
+def _submit_command(c, conf, jar, payload, name):
     command=[os.environ.get("SPARK_HOME","/opt/spark")+"/bin/spark-submit","--master",c["cluster"]["master"],
              "--deploy-mode","cluster","--name",name,"--class","BaselineBenchmark"]
     for key,value in conf.items():command += ["--conf",key+"="+value]
-    command += [str(jar),remote_contract,c["query_part"],remote_truth,remote+"/samples.jsonl",kind,str(k)]
-    return conf,command
+    command += [str(jar)]+[str(item) for item in payload]
+    return command
+
+
+def cell_command(c, kind, k, jar, remote_contract, remote_truth, remote, name, storage):
+    """Build the reviewed spark-submit invocation for one vector cell (pure: no cluster access)."""
+    conf=_cell_conf(c,name,remote,storage)
+    return conf,_submit_command(c,conf,jar,[remote_contract,c["query_part"],remote_truth,
+                                            remote+"/samples.jsonl",kind,str(k)],name)
+
+
+def text_cell_command(c, text, jar, remote, name, storage):
+    """The optional sixth cell: same conf/scheduling, only the JVM payload differs."""
+    conf=_cell_conf(c,name,remote,storage)
+    return conf,_submit_command(c,conf,jar,[text["remote_contract"],text["remote_asset"],
+                                            remote+"/samples.jsonl","text",str(text["k"])],name)
+
+
+def text_cell_plan(c, text_contract_path, remote_root="<hdfs-run-root>"):
+    """Pure dry-run plan for the text cell: validates frozen bytes, prints a redacted command.
+
+    No ssh, kubectl, docker or subprocess: the only work is reading two local files and building
+    the same spark-submit argv ``run_one_cell`` would use, with storage values placeheld.
+    """
+    text_contract_path=Path(text_contract_path).resolve()
+    baseline.require(text_contract_path.is_file(),"text contract not found: "+str(text_contract_path))
+    text_contract=json.loads(text_contract_path.read_text());baseline.validate_text_contract(text_contract)
+    rows=baseline.load_text_asset(text_contract,text_contract_path)
+    text={"contract":text_contract,"k":text_contract["k"],"queries":[row["query"] for row in rows],
+          "queries_sha256":text_contract["queries_sha256"],
+          "remote_contract":remote_root+"/text-contract.json","remote_asset":remote_root+"/text-queries.jsonl"}
+    conf,command=text_cell_command(c,text,"<compiled>/BaselineBenchmark.jar",remote_root+"/text-k10",
+                                   "b<card>-text-k10-<run>",placeholder_storage())
+    return {"kind":"text","k":text_contract["k"],"class":"BaselineBenchmark","cell_dir":"text-k10",
+            "queries":len(rows),"queries_sha256":text_contract["queries_sha256"],
+            "contract_sha256":baseline.sha256(text_contract_path),
+            "warmup_passes":text_contract["warmup_passes"],"repeats":text_contract["repeats"],
+            "samples":baseline.text_expected_samples(text_contract),
+            "result_contract":"doc_uuid,_score; ORDER BY `_score` DESC LIMIT 10",
+            "sql_template":text_contract["sql_template"],
+            "sql_examples":[baseline.text_sql(text_contract,rows[0]["query"]),
+                            baseline.text_sql(text_contract,rows[-1]["query"])],
+            "spark_conf":conf,"spark_submit_command":command}
 
 
 def cancel_own(ns, name, uid, ledger, run_id, output, secrets):
@@ -373,8 +422,13 @@ def cancel_own(ns, name, uid, ledger, run_id, output, secrets):
         store(output,"cancel.json",{"code":p.returncode,"output":p.stdout+p.stderr},secrets)
 
 
-def prepare_matrix(c, contract_path, queries_path, truth_path, output, stopped_evidence=None):
+def prepare_matrix(c, contract_path, queries_path, truth_path, output, stopped_evidence=None,
+                   text_contract_path=None):
     """Validate frozen assets, fence the UID ledger, compile the JVM source, create the run root.
+
+    ``text_contract_path`` enables the optional sixth cell: its frozen contract and query asset
+    are validated by sha256 here (and again by the JVM), copied into the run root for later
+    read-only reporting, and uploaded create-only next to contract.json/truth.json.
 
     Returns the context ``run_one_cell`` needs. ``pair-run.py`` calls this once per (arm, round)
     so every replicate keeps its own manifest, compiled jar and HDFS evidence root.
@@ -385,25 +439,48 @@ def prepare_matrix(c, contract_path, queries_path, truth_path, output, stopped_e
         VERIFIED_STOPPED_DRIVERS.update(load_stopped_evidence(stopped_evidence))
     baseline.validate_contract(c);baseline.validate_asset_files(c,queries_path,truth_path)
     baseline.require(baseline.query_float32_sha256([json.loads(l) for l in Path(queries_path).read_text().splitlines() if l.strip()])==c["query_float32_sha256"],"frozen queries changed")
+    text=None
+    if text_contract_path is not None:
+        text_contract_path=Path(text_contract_path).resolve()
+        baseline.require(text_contract_path.is_file(),"text contract not found: "+str(text_contract_path))
+        text_contract=json.loads(text_contract_path.read_text());baseline.validate_text_contract(text_contract)
+        rows=baseline.load_text_asset(text_contract,text_contract_path)
+        text={"contract":text_contract,"contract_path":text_contract_path,"queries":[row["query"] for row in rows],
+              "k":text_contract["k"],"asset_path":text_contract_path.with_name(text_contract["queries_asset"]),
+              "queries_sha256":text_contract["queries_sha256"]}
     output=Path(output).resolve();output.mkdir(parents=True,exist_ok=False)
     runid="matrix-"+datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")+"-"+uuid.uuid4().hex[:8]
     remote=c["cluster"]["evidence_root"]+"/"+runid
     storage,secrets=platform_config();hdfs=os.environ.get("HADOOP_HOME","/opt/hadoop-3.3.1")+"/bin/hdfs"
-    store(output,"manifest.json",{"run_id":runid,"contract_sha256":baseline.sha256(contract_path),"truth_sha256":baseline.sha256(truth_path),
-                                 "query_json_sha256":baseline.sha256(queries_path),"schedule":schedule(),"executor_schedule":"default, all nodes observed",
-                                 "cells":baseline.cells(c),"remote":remote,"status":"STARTING",
-                                 "window_policy":"record overlapping foreign benchmark/unknown activity and keep the cell; only coverage/API/marker failures void a cell",
-                                 "verified_stopped_drivers":VERIFIED_STOPPED_DRIVERS},secrets)
+    manifest={"run_id":runid,"contract_sha256":baseline.sha256(contract_path),"truth_sha256":baseline.sha256(truth_path),
+              "query_json_sha256":baseline.sha256(queries_path),"schedule":schedule(),"executor_schedule":"default, all nodes observed",
+              "cells":baseline.cells(c),"remote":remote,"status":"STARTING","text_cell":text is not None,
+              "window_policy":"record overlapping foreign benchmark/unknown activity and keep the cell; only coverage/API/marker failures void a cell",
+              "verified_stopped_drivers":VERIFIED_STOPPED_DRIVERS}
+    if text is not None:
+        # Frozen text-cell identity: the report re-checks these bytes against the run root copies.
+        text["remote_contract"]=remote+"/text-contract.json";text["remote_asset"]=remote+"/text-queries.jsonl"
+        (output/"text-contract.json").write_text(text["contract_path"].read_text())
+        (output/"text-queries.jsonl").write_text(text["asset_path"].read_text())
+        manifest.update({"text_contract_sha256":baseline.sha256(text["contract_path"]),
+                         "text_queries_sha256":text["queries_sha256"],
+                         "text_cell_detail":{"kind":"text","k":text["k"],"queries":len(text["queries"]),
+                                             "warmup_passes":text["contract"]["warmup_passes"],
+                                             "repeats":text["contract"]["repeats"],
+                                             "sql_template":text["contract"]["sql_template"]}})
+    store(output,"manifest.json",manifest,secrets)
     src=Path(__file__).with_name("BaselineBenchmark.java");build=output/"build";build.mkdir();(build/"classes").mkdir()
     image=c["image"]+"@"+c["image_digest"]
     compiled=pilot.call(["docker","run","--rm","--user","0","--entrypoint","/bin/bash","-v",str(src)+":/src/BaselineBenchmark.java:ro",
                          "-v",str(build)+":/run",image,"-lc",'set -e; "$JAVA_HOME/bin/javac" -cp "/opt/spark/jars/*" -d /run/classes /src/BaselineBenchmark.java; "$JAVA_HOME/bin/jar" cf /run/BaselineBenchmark.jar -C /run/classes .'],timeout=300)
     store(build,"compile.log",compiled.stdout+compiled.stderr,secrets);baseline.require(compiled.returncode==0,"matrix source compile failed")
     p=pilot.call([hdfs,"dfs","-mkdir","-p",remote],timeout=45);baseline.require(p.returncode==0,"HDFS evidence creation failed")
-    for local,name in [(contract_path,"contract.json"),(truth_path,"truth.json")]:
-        p=pilot.call([hdfs,"dfs","-put",str(local),remote+"/"+name],timeout=60);baseline.require(p.returncode==0,"create-only asset upload failed")
+    uploads=[(contract_path,"contract.json"),(truth_path,"truth.json")]
+    if text is not None: uploads += [(text["contract_path"],"text-contract.json"),(text["asset_path"],"text-queries.jsonl")]
+    for local,name in uploads:
+        p=pilot.call([hdfs,"dfs","-put",str(local),remote+"/"+name],timeout=60);baseline.require(p.returncode==0,"create-only asset upload failed: "+name)
     return {"contract":c,"output":output,"runid":runid,"remote":remote,"storage":storage,
-            "secrets":secrets,"hdfs":hdfs,"jar":build/"BaselineBenchmark.jar"}
+            "secrets":secrets,"hdfs":hdfs,"jar":build/"BaselineBenchmark.jar","text":text}
 
 
 def run_one_cell(ctx, kind, k, window_seconds):
@@ -420,8 +497,12 @@ def run_one_cell(ctx, kind, k, window_seconds):
     name="b3255-"+kind+"-k"+str(k)+"-"+uuid.uuid4().hex[:12]
     pod,ok=pilot.get_pod(ns,name);baseline.require(ok and pod is None,"unique pod precondition failed")
     remote=remote_root+f"/{kind}-k{k}"
-    conf,command=cell_command(c,kind,k,jar,remote_root+"/contract.json",remote_root+"/truth.json",
-                              remote,name,storage)
+    if kind=="text":
+        baseline.require(ctx.get("text") is not None,"text cell was not prepared with a frozen contract")
+        conf,command=text_cell_command(c,ctx["text"],jar,remote,name,storage)
+    else:
+        conf,command=cell_command(c,kind,k,jar,remote_root+"/contract.json",remote_root+"/truth.json",
+                                  remote,name,storage)
     store(output,"spark-conf.json",conf,secrets)
     p=pilot.call([hdfs,"dfs","-mkdir","-p",remote+"/spark-events"],timeout=45)
     baseline.require(p.returncode==0,"cannot create event directory")
@@ -494,7 +575,7 @@ def run_one_cell(ctx, kind, k, window_seconds):
                  "cleanup":"own terminal pod retained as evidence"}
         verdict.update(window_state)
         try:
-            validate_expected_cell(records,kind,k,eventlog)
+            validate_expected_cell(records,kind,k,eventlog,(ctx.get("text") or {}).get("contract"))
         except (ValueError,KeyError) as exc:
             # Samples that fail validation are never acceptable, whatever the window looked like.
             verdict["validation_error"]=str(exc)
@@ -521,24 +602,40 @@ def load_stopped_evidence(path):
     return evidence
 
 
-def run_matrix(c,contract_path,queries_path,truth_path,output,window_seconds=1800,stopped_evidence=None):
-    ctx=prepare_matrix(c,contract_path,queries_path,truth_path,output,stopped_evidence)
+def run_matrix(c,contract_path,queries_path,truth_path,output,window_seconds=1800,stopped_evidence=None,
+               text_cell=False,text_contract_path=None):
+    """Run the five frozen vector cells, then the optional text cell, under one lifecycle.
+
+    ``text_cell=False`` keeps the historical five-cell matrix byte-for-byte; enabling it only
+    appends text-k10 after batch-k2000 and counts it in matrix-verdict.cells/samples.
+    """
+    if text_cell:
+        baseline.require(text_contract_path is not None,"--text-cell requires a frozen text contract")
+        ctx=prepare_matrix(c,contract_path,queries_path,truth_path,output,stopped_evidence,
+                           text_contract_path=text_contract_path)
+    else:
+        ctx=prepare_matrix(c,contract_path,queries_path,truth_path,output,stopped_evidence)
     out=ctx["output"];secrets=ctx["secrets"];records=[];verdicts=[]
+    cells=baseline.cells(c)+(baseline.text_cells() if text_cell else [])
     try:
-        for kind,k in baseline.cells(c):
+        for kind,k in cells:
             cell_records,verdict=run_one_cell(ctx,kind,k,window_seconds)
             records += cell_records;verdicts.append(verdict)
-        summary=baseline.validate_matrix(records,True)
+        summary=baseline.validate_matrix(records,True,text=text_cell)
         usable=[verdict for verdict in verdicts if verdict.get("window_usable") is True]
         clean=[verdict for verdict in verdicts if verdict.get("exclusive_window_valid") is True]
-        store(out,"matrix-verdict.json",{"complete":len(usable)==len(verdicts)==len(baseline.cells(c)),
-            "cells":len(baseline.cells(c)),"cells_usable":len(usable),"cells_clean":len(clean),
+        result={"complete":len(usable)==len(verdicts)==len(cells),
+            "cells":len(cells),"cells_usable":len(usable),"cells_clean":len(clean),
             "contaminated_cells":[cell_name(v) for v in verdicts if v.get("contamination")],
             "window_wait_exhausted_cells":[cell_name(v) for v in verdicts if v.get("window_wait_exhausted") is True],
-            "samples":summary["samples"],"cache_residency":"unknown"},secrets)
+            "samples":summary["samples"],"cache_residency":"unknown","text_cell":text_cell}
+        if text_cell:
+            result["text_queries_sha256"]=ctx["text"]["queries_sha256"]
+        store(out,"matrix-verdict.json",result,secrets)
     except Exception as exc:
         store(out,"matrix-verdict.json",{"complete":False,"failure_type":type(exc).__name__,
             "reason":str(exc),"accepted_samples":len(records),"cells_completed":len(verdicts),
+            "cells_planned":len(cells),"text_cell":text_cell,
             "cells_usable":sum(v.get("window_usable") is True for v in verdicts),
             "cells_clean":sum(v.get("exclusive_window_valid") is True for v in verdicts),
             "contaminated_cells":[cell_name(v) for v in verdicts if v.get("contamination")],

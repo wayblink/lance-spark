@@ -31,18 +31,21 @@ ACCOUNTED_FIELDS = (
 # --baseline must hash to this value, otherwise the five-cell comparison is not the same one.
 BASELINE_SHA256 = "a29c97557f178e877ff9c9d29c42dfd186e13ffce3fde250ef427520342a19f4"
 
-# The runner files that actually submit and validate cells. They may only be synced to the
-# remote host when their bytes match the reviewed version (the one that produced C5/b102cc7
-# behaviour plus the single-tolerance window fix and the 2026-11-25 window policy: foreign
-# benchmark activity is recorded, coverage/API/marker failures still void a cell). Anything else
-# is refused before ssh.
+# The runner files that actually submit and validate cells, plus the frozen text-cell contract
+# and query asset (the optional sixth cell is only reviewable when these bytes are pinned). They
+# may only be synced to the remote host when their bytes match the reviewed version (the one that
+# produced C5/b102cc7 behaviour plus the single-tolerance window fix, the 2026-11-25 window policy
+# -- foreign benchmark activity is recorded, coverage/API/marker failures still void a cell -- and
+# the text BM25 k=10 cell added by card #3285). Anything else is refused before ssh.
 RUNNER_SHA256 = {
-    "submit.py": "48243a451efc1411bd3aeffee33092c3e257481ad22bd1274dbc53f829314399",
-    "baseline.py": "3ac5a95659db6746afd27a3585dff4c1de8a1d4caf9bc0c13424587245a7b363",
+    "submit.py": "53bf754e4271f2cc6f7340d2d5a25e1bd055118476f68513b621fec9507b35ea",
+    "baseline.py": "5c9f31f5c57c2be3f3b0c30cd0b26eeba268021f9ac3ab0558919583838a0420",
     "pilot.py": "1e9f57b422cf98b98b62c87eb9c28d42b5f1c3931b5a026267389c4cedc1c9d7",
-    "benchmark.py": "0d199446575427f37e2977f858066286792151830c34745eb307ab7e1a4fd77c",
-    "BaselineBenchmark.java": "a5ea65c0e6603882255e6a2e61c4953eb010ef62140e8c4675715f58ae5a83a8",
+    "benchmark.py": "845231d665829d806b3a8dc8f3c92227da25e19281b342aada0e436c0a76f76d",
+    "BaselineBenchmark.java": "258dbcde51da43c59dc57c893a2d0138bef0f4b6b77faf52a5a08ce8a1e7a4d2",
     "verified-stopped-drivers.json": "299287912c4dba978ef58c4333c2a7337444d5b92cffc027a39244e340577db8",
+    "text-10m.json": "efba1225617f4497ca8984b2186d4b1c9156c7c9955f79c44c83099a9de62c2f",
+    "text-queries-10m.jsonl": "9d04605cc228cb9b7f9a9bc22a73ef9fd917daa0eb4d51bb808800ac660d3bc3",
 }
 
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")

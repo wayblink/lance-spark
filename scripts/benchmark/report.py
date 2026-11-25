@@ -31,6 +31,13 @@ Statistics contract (do not change a number without changing this docstring):
 * ``outliers`` = measured ``ms`` > 5 x that identity's measured median
   (``--outlier-factor``). Outliers stay inside p50/p95 -- they are listed with
   qid/repeat/ms/share of the cell's measured total, and never dropped.
+* Text cell (optional, off by default): kind ``text``, k=10, 20 identities (qid 0..19) tied to
+  the frozen ``text-queries-10m.jsonl`` asset; the same warmup+3 repeats rule gives 60 measured
+  samples. Per-identity value = median of 3 measured ``ms``; cell p50 = median of the 20 identity
+  medians; cell p95 = linear quantile over all 60 measured samples. BM25 has no recall truth, so
+  ``recall_min`` stays ``n/a`` (never 0). When the run root carries ``text-contract.json`` +
+  ``text-queries.jsonl``, each measured ``sql`` must equal the frozen template with the frozen
+  query substituted; a mismatch is reported as a problem and the cell is not silently trusted.
 * Anything missing is rendered ``n/a`` with a reason: absent cell directory,
   absent ``samples.jsonl`` / ``verdict.json``, zero measured samples,
   ``complete=false`` records, or ``verdict.baseline_valid=false`` (the runner
@@ -66,7 +73,8 @@ OUTLIER_FACTOR = 5.0
 
 KIND_LABELS = {"single": "向量单查询", "batch": "批量", "fts": "文本 BM25",
                "text": "文本 BM25", "bm25": "文本 BM25", "text-bm25": "文本 BM25"}
-KIND_ORDER = {"single": 0, "batch": 1}
+TEXT_KINDS = ("text", "fts", "bm25", "text-bm25")
+KIND_ORDER = {"single": 0, "batch": 1, "text": 2, "fts": 2, "bm25": 2, "text-bm25": 2}
 
 # label, spark-conf key, group used to explain a mismatch direction.
 RESOURCE_ROWS = (
@@ -185,6 +193,7 @@ def empty_cell(kind, k, directory):
         "problems": [], "unavailable": None, "missing": [],
         "verdict": {}, "activity": {}, "spark_conf": {},
         "sql_checked": 0, "sql_mismatch": 0, "complete": False,
+        "text_sql_checked": 0, "text_sql_mismatch": 0, "text_issue": None,
     }
 
 
@@ -279,7 +288,75 @@ def sql_evidence(measured, contract):
     return checked, mismatch
 
 
-def compute_cell(kind, k, directory, run_name, contract, skip_missing, outlier_factor):
+def load_text_identity(directory):
+    """Read the optional frozen text-cell identity copied into the run root by submit.
+
+    Returns ``(contract, {qid: query}, issue)``. A missing contract is only an issue for a run
+    that actually has a text cell; a sha256 mismatch or a malformed asset makes the text numbers
+    unverifiable instead of silently trusted (the vector cells still render).
+    """
+    contract_path = Path(directory) / "text-contract.json"
+    asset_path = Path(directory) / "text-queries.jsonl"
+    if not contract_path.is_file():
+        return None, None, "无 text-contract.json（该 run 未冻结文本格身份）"
+    contract = read_json(contract_path, "text contract")
+    if not asset_path.is_file():
+        return contract, None, "缺 text-queries.jsonl"
+    data = asset_path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != contract.get("queries_sha256"):
+        return contract, None, "text-queries.jsonl 的 sha256 与 text-contract.json 不一致"
+    queries = {}
+    for number, line in enumerate(data.decode("utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return contract, None, "text-queries.jsonl:%d 非法 JSON" % number
+        if (not isinstance(row, dict) or set(row) != {"qid", "query"}
+                or isinstance(row.get("qid"), bool) or not isinstance(row.get("qid"), int)
+                or not isinstance(row.get("query"), str) or not row["query"]):
+            return contract, None, "text-queries.jsonl:%d 字段必须恰为 qid+query" % number
+        if row["qid"] in queries:
+            return contract, None, "text-queries.jsonl:%d qid 重复" % number
+        queries[row["qid"]] = row["query"]
+    if sorted(queries) != list(range(len(queries))):
+        return contract, None, "text-queries.jsonl 的 qid 不是 0..N-1"
+    if contract.get("queries") != len(queries):
+        return contract, None, "text-queries.jsonl 条数与 text-contract.json 不一致"
+    return contract, queries, None
+
+
+def text_sql_evidence(measured, text_contract, text_queries):
+    """Count measured text SQL that matches the frozen template; structural check as fallback."""
+    if text_contract and text_queries and isinstance(text_contract.get("sql_template"), str):
+        template = text_contract["sql_template"]
+        checked = mismatch = 0
+        for record in measured:
+            checked += 1
+            try:
+                qid = int(record["qid"])
+            except (TypeError, ValueError):
+                mismatch += 1
+                continue
+            query = text_queries.get(qid)
+            if query is None:
+                mismatch += 1
+                continue
+            if record["sql"] != template.replace("{query}", query.replace("'", "''")):
+                mismatch += 1
+        return checked, mismatch
+    checked = mismatch = 0
+    for record in measured:
+        checked += 1
+        statement = str(record["sql"])
+        if not ("lance_match(" in statement and "ORDER BY `_score` DESC" in statement
+                and " LIMIT " in statement and "VECTOR_SEARCH" not in statement):
+            mismatch += 1
+    return checked, mismatch
+
+
+def compute_cell(kind, k, directory, run_name, contract, skip_missing, outlier_factor, text_identity=None):
     """Stream one cell's samples; keep only the fields the report needs.
 
     Batch k=2000 samples carry ~200k result rows each, so records are never retained
@@ -390,7 +467,8 @@ def compute_cell(kind, k, directory, run_name, contract, skip_missing, outlier_f
     for record in measured:
         recall = record["recall"]
         if not isinstance(recall, dict) or not recall:
-            cell["recall_missing"] += 1
+            if kind not in TEXT_KINDS:
+                cell["recall_missing"] += 1
             continue
         for value in recall.values():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -429,6 +507,20 @@ def compute_cell(kind, k, directory, run_name, contract, skip_missing, outlier_f
     cell["sql_checked"], cell["sql_mismatch"] = checked, mismatch
     if mismatch:
         cell["problems"].append("SQL 与合同索引参数不一致（%d/%d 条）" % (mismatch, checked))
+    if kind in TEXT_KINDS:
+        text_contract, text_queries, issue = text_identity or (
+            None, None, "无 text-contract.json（该 run 未冻结文本格身份）")
+        cell["text_issue"] = issue
+        checked, mismatch = text_sql_evidence(measured, text_contract, text_queries)
+        cell["text_sql_checked"], cell["text_sql_mismatch"] = checked, mismatch
+        if mismatch:
+            cell["problems"].append("文本 SQL 与冻结模板不一致（%d/%d 条）" % (mismatch, checked))
+        if issue:
+            cell["problems"].append("文本格证据不完整：%s（SQL 未与冻结查询集核对）" % issue)
+        expected = (text_contract or {}).get("queries")
+        if isinstance(expected, int) and cell["queries"] != expected:
+            cell["problems"].append("文本格 measured 覆盖 %s 条 query，合同要求 %d 条"
+                                    % (cell["queries"], expected))
     return cell
 
 
@@ -482,6 +574,7 @@ def load_run(name, directory, args):
     run["contract_matches_manifest"] = (
         None if run["manifest_contract_sha256"] is None else
         run["manifest_contract_sha256"] == run["contract_sha256"])
+    run["text_contract"], run["text_queries"], run["text_issue"] = load_text_identity(directory)
     for child in sorted(directory.iterdir()):
         if not child.is_dir():
             continue
@@ -489,8 +582,9 @@ def load_run(name, directory, args):
         if identity is None:
             continue
         kind, k = identity
-        run["cells"][(kind, k)] = compute_cell(kind, k, child, name, contract,
-                                               args.skip_missing_cells, args.outlier_factor)
+        run["cells"][(kind, k)] = compute_cell(
+            kind, k, child, name, contract, args.skip_missing_cells, args.outlier_factor,
+            (run["text_contract"], run["text_queries"], run["text_issue"]))
     if not run["cells"]:
         fail("run %s: no cell directories (expected names like single-k10) under %s"
              % (name, directory))
@@ -958,7 +1052,9 @@ def render_completeness(control, treatment, rows):
                 lines.append("| %s | %d | %s | n/a | n/a | n/a | n/a | n/a | %s |" % (
                     md_cell(scene_label(kind, cell)), k, md_cell(role), md_cell(note)))
                 continue
-            if cell["recall_min"] is None:
+            if kind in TEXT_KINDS:
+                recall = "n/a（文本无真值）"
+            elif cell["recall_min"] is None:
                 recall = "n/a（样本无 recall）"
             else:
                 recall = "%.2f" % cell["recall_min"]
@@ -981,6 +1077,9 @@ def contract_cells(run):
     contract = (run or {}).get("contract") or {}
     cells = [("single", int(k)) for k in (contract.get("single_ks") or [])]
     cells += [("batch", int(k)) for k in (contract.get("batch_ks") or [])]
+    text = (run or {}).get("text_contract") or {}
+    if isinstance(text.get("k"), int):
+        cells.append(("text", int(text["k"])))
     return cells
 
 
@@ -1035,6 +1134,9 @@ def render_gaps(control, treatment, rows):
               "- `n/a` 表示无数据或 harness 判定无效，绝不以 0 代替；`*` 表示该格 measured 不完整。",
               "- 比值按单元格 p50 计算（批量格用整批总耗时 p50；两侧 N 相同时与每查询比值等价）。",
               "- 本表是只读后处理，不重新测量；任何重新计算都必须换新 run 目录，而不是改本脚本的输入。"]
+    if any(kind in TEXT_KINDS for kind, _k in rows):
+        lines.append("- 文本 BM25 格是可选第六格（默认关闭），追加在向量五格之后单独跑；它不参与向量"
+                     "五格的比值，也没有接入 pair-run 的交错窗口，跨臂文本比较需两臂各自重跑并核对窗口。")
     return lines
 
 

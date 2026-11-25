@@ -27,6 +27,7 @@ Remote defaults (override by flag or environment):
   SPARK_HOME    --spark-home    / FEATURE_SPARK_HOME        /opt/spark
   tool dir      --tool-dir                                  ~/runs/<UTC stamp>-tool-<card>
   window        --window-seconds                            1800
+  text cell     --text-cell                                 off (adds the optional text BM25 k=10 cell)
   output root   --output-root   local directory on the remote host, created by benchmark.py
   assets        --queries/--truth  local files on the remote host; benchmark.py uploads them
                                  to HDFS create-only, so they must already exist there
@@ -179,6 +180,10 @@ def build_plan(args):
              "--contract", CONTRACT_NAME, "--queries", queries, "--truth", truth,
              "--output-root", output_root, "--window-seconds", str(args.window_seconds)]
     bench += ["--stopped-evidence", STOPPED_NAME]
+    if getattr(args, "text_cell", False):
+        # benchmark.py resolves text-10m.json next to itself (the synced tool dir) and refuses
+        # an asset whose sha256 does not match the frozen text contract.
+        bench.append("--text-cell")
     launch = launch_command(tool_dir, env, bench, runner_log, pid_file)
 
     guards = [{"path": tool_dir, "policy": "create-only"},
@@ -356,6 +361,8 @@ def main(argv=None):
         "FEATURE_SPARK_HOME", "/opt/spark"))
     parser.add_argument("--card", help="card id used in the default tool dir")
     parser.add_argument("--window-seconds", type=int, default=1800)
+    parser.add_argument("--text-cell", action="store_true",
+                        help="also run the optional text BM25 k=10 cell after the five vector cells")
     parser.add_argument("--sync-method", choices=["rsync", "scp"], default="rsync")
     parser.add_argument("--sync-timeout", type=int, default=600)
     parser.add_argument("--launch-timeout", type=int, default=120)

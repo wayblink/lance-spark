@@ -14,16 +14,22 @@
 package org.lance.spark.search;
 
 import org.apache.spark.sql.connector.read.Scan;
-import org.apache.spark.sql.connector.read.ScanBuilder;
+import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.types.StructType;
 
-public class LanceDistributedSearchScanBuilder implements ScanBuilder {
-  private final StructType schema;
-  private final LanceSearchQuery query;
+public class LanceDistributedSearchScanBuilder implements SupportsPushDownRequiredColumns {
+  private StructType schema;
+  private LanceSearchQuery query;
 
   public LanceDistributedSearchScanBuilder(StructType schema, LanceSearchQuery query) {
     this.schema = schema;
     this.query = query;
+  }
+
+  @Override
+  public void pruneColumns(StructType requiredSchema) {
+    schema = requiredSchema;
+    query = LanceSearchProjection.prune(query, requiredSchema);
   }
 
   @Override

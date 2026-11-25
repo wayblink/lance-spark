@@ -15,8 +15,15 @@ package org.lance.spark.search;
 
 import org.lance.spark.read.metric.LanceCustomMetrics;
 
+import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.execution.SparkPlan;
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec;
+import org.apache.spark.sql.execution.adaptive.QueryStageExec;
+import org.apache.spark.sql.execution.datasources.v2.BatchScanExec;
+import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
@@ -329,6 +336,49 @@ public abstract class BaseSparkDistributedVectorSearchTest {
     assertTrue(
         metrics.getOrDefault(LanceCustomMetrics.BATCH_LOAD_TIME_NS, 0L) > 0,
         "batchLoadTimeNs: " + metrics);
+  }
+
+  @Test
+  void distributedRequiredProjectionReachesSearchScan() {
+    String fullName = createFiveFragmentTable();
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    Dataset<Row> result =
+        spark.sql(
+            "SELECT id, _distance FROM VECTOR_SEARCH(table => '"
+                + fullName
+                + "', query_vector => array(0.0, 0.0, 0.0, 0.0), k => 2)");
+    List<Row> rows = result.collectAsList();
+    assertEquals(2, rows.size());
+    assertEquals(0, rows.get(0).getInt(0));
+    StructType scanSchema = findBatchScanSchema(result);
+    assertEquals(
+        java.util.Arrays.asList("id", "_distance", "_rowid"),
+        java.util.Arrays.asList(scanSchema.fieldNames()));
+  }
+
+  private static StructType findBatchScanSchema(Dataset<Row> dataset) {
+    return findBatchScanSchema(dataset.queryExecution().executedPlan());
+  }
+
+  private static StructType findBatchScanSchema(SparkPlan plan) {
+    if (plan instanceof BatchScanExec) {
+      Scan scan = ((BatchScanExec) plan).scan();
+      if (scan.readSchema().fieldNames().length > 0
+          && java.util.Arrays.asList(scan.readSchema().fieldNames()).contains("_distance")) {
+        return scan.readSchema();
+      }
+    }
+    if (plan instanceof AdaptiveSparkPlanExec) {
+      return findBatchScanSchema(((AdaptiveSparkPlanExec) plan).executedPlan());
+    }
+    if (plan instanceof QueryStageExec) {
+      return findBatchScanSchema(((QueryStageExec) plan).plan());
+    }
+    for (SparkPlan child : scala.collection.JavaConverters.seqAsJavaList(plan.children())) {
+      StructType result = findBatchScanSchema(child);
+      if (result != null) return result;
+    }
+    throw new AssertionError("VECTOR_SEARCH BatchScanExec not found in " + plan);
   }
 
   private List<Integer> idsOf(String sql) {

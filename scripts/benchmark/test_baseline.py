@@ -71,7 +71,7 @@ class ContractTests(unittest.TestCase):
 
 class ResultsTests(unittest.TestCase):
     def test_true_batch_cardinality_and_query_ids(self):
-        rows = [{"query_id": q, "doc_uuid": str(i), "_distance": float(i)}
+        rows = [{"query_id": q, "doc_uuid": str(i), "_rowid": i, "_distance": float(i)}
                 for q in range(100) for i in range(10)]
         baseline.validate_rows(rows, 100, 10)
         for bad in [rows[:-1], rows + [rows[0]],
@@ -100,6 +100,41 @@ class ResultsTests(unittest.TestCase):
         self.assertEqual(baseline.query_float32_sha256(first), baseline.query_float32_sha256(cast))
         self.assertNotEqual(baseline.query_float32_sha256(first),
                             baseline.query_float32_sha256([{"qid": 1, "vector": [0.1, 1.0]}]))
+
+    def test_matrix_requires_exactly_five_cells_and_rowid_is_entity(self):
+        cfg = contract()
+        groups = []
+        for kind, k in baseline.cells(cfg):
+            qids = range(10) if kind == "single" else ["batch"]
+            records = []
+            for q in qids:
+                base = {"kind": kind, "k": k, "qid": q, "complete": True, "started_ms": 100, "ms": 1}
+                records += [{**base, "warmup": True}] + [{**base, "warmup": False, "repeat": r} for r in range(3)]
+            groups.append(records)
+        baseline.validate_matrix([r for g in groups for r in g], True)
+        with self.assertRaises(ValueError): baseline.validate_matrix(groups[0], True)
+        bad = copy.deepcopy(groups[-1]);
+        for r in bad: r["k"] = 10
+        with self.assertRaises(ValueError): baseline.validate_matrix([r for g in groups[:-1] for r in g] + bad, True)
+        same_doc = [{"query_id": 0, "doc_uuid": "same", "_rowid": r, "_distance": float(r)} for r in range(2)]
+        baseline.validate_rows(same_doc, 1, 2)
+        with self.assertRaises(ValueError): baseline.validate_rows([same_doc[0], same_doc[0]], 1, 2)
+
+    def test_asset_cli_hash_is_canonical_and_not_json_bytes(self):
+        cfg = contract(); qs = [{"qid": i, "vector": [0.1] * 2560} for i in range(100)]
+        expected = baseline.query_float32_sha256(qs)
+        truth = {"metadata": baseline.truth_identity(cfg, expected), "queries": [
+            {"qid": i, "ids": ["same"] * 2000, "rowids": list(range(2000)), "distances": list(range(2000))}
+            for i in range(100)]}
+        baseline.validate_assets(cfg, qs, truth, expected)
+        with tempfile.TemporaryDirectory() as root:
+            q = Path(root) / "queries.jsonl"; t = Path(root) / "truth.json"
+            q.write_text("\n".join(json.dumps(x, indent=None) for x in qs));t.write_text(json.dumps(truth))
+            baseline.validate_asset_files(cfg, q, t)
+            q.write_text("\n".join(json.dumps(x, separators=(",", ":")) for x in qs))
+            baseline.validate_asset_files(cfg, q, t)
+            qs[0]["vector"][0] = 0.2;q.write_text("\n".join(json.dumps(x) for x in qs))
+            with self.assertRaises(ValueError): baseline.validate_asset_files(cfg, q, t)
 
     def test_window_ignores_terminal_and_uses_uid_not_name(self):
         own = {"uid": "ours", "name": "mine", "phase": "Running", "role": "executor"}

@@ -31,6 +31,7 @@ def validate_contract(c):
     require(c["index"] == "r3-ivf-4b" and c["nprobes"] == 8 and c["metric"] == "l2", "search axis changed")
     require(c["refine_factor"] is None, "baseline refine must be absent, never translate 0 to 1")
     require(c["id_column"] == "doc_uuid" and c["vector_column"] == "qwen_3_4b_embedding", "columns changed")
+    require(c["with_row_id"] is True and c["result_columns"] == ["query_id", "doc_uuid", "_rowid", "_distance"], "result rowid contract changed")
     require(c["warmup_passes"] >= 1 and c["repeats"] >= 3, "warmup and >=3 repeats required")
     uuids = sorted(c["index_uuids"])
     require(len(set(uuids)) == c["index_segments"] == 32, "32 distinct index segments required")
@@ -95,7 +96,7 @@ def validate_assets(c, queries, truth, query_hash):
     require(len(rows) == 100 and sorted(q["qid"] for q in rows) == list(range(100)), "truth must cover all 100 queries")
     for q in rows:
         require(len(q["ids"]) == len(q["rowids"]) == len(q["distances"]) == 2000, "truth must contain full top2000 per query")
-        require(len(set(q["rowids"])) == 2000 and len(set(q["ids"])) == 2000, "truth contains duplicate row ids or doc ids")
+        require(len(set(q["rowids"])) == 2000, "truth contains duplicate row ids")
         distances = q["distances"]
         require(all(math.isfinite(float(x)) for x in distances), "invalid truth distance")
         require(list(zip(distances, q["rowids"])) == sorted(zip(distances, q["rowids"])),
@@ -110,9 +111,10 @@ def validate_rows(rows, queries, k):
         require(q in grouped, "unknown query id")
         require(row.get("doc_uuid") is not None, "NULL doc_uuid")
         require(math.isfinite(float(row["_distance"])), "invalid distance")
-        grouped[q].append(row["doc_uuid"])
+        require(isinstance(row.get("_rowid"), int), "rowid entity missing")
+        grouped[q].append(row["_rowid"])
     for q, ids in grouped.items():
-        require(len(ids) == k and len(set(ids)) == k, f"query {q} needs k distinct results")
+        require(len(ids) == k and len(set(ids)) == k, f"query {q} needs k distinct rowids")
 
 
 def validate_run(records, eventlog_present):
@@ -122,7 +124,7 @@ def validate_run(records, eventlog_present):
     for rec in records:
         require(rec.get("complete") is True, "failed/cancelled sample")
         kind, k, qid = rec.get("kind"), rec.get("k"), rec.get("qid", "batch")
-        require(kind in ("single", "batch") and k in (10, 100, 2000), "cell identity missing")
+        require((kind, k) in [("single", 10), ("single", 100), ("single", 2000), ("batch", 100), ("batch", 2000)], "invalid cell identity")
         identity = (kind, k, qid)
         if rec.get("warmup"):
             warmed.add(identity)
@@ -144,6 +146,18 @@ def validate_run(records, eventlog_present):
                    for x in diagnostics)
     return {"warmup_valid": True, "cache_residency": "verified" if verified else "unknown",
             "samples": sum(map(len, observed.values()))}
+
+
+def validate_matrix(records, eventlog_present):
+    require({(x.get("kind"), x.get("k")) for x in records} ==
+            {("single", 10), ("single", 100), ("single", 2000), ("batch", 100), ("batch", 2000)},
+            "full baseline requires exactly five fixed cells")
+    return validate_run(records, eventlog_present)
+
+
+def validate_asset_files(c, queries_path, truth_path):
+    queries = [json.loads(l) for l in Path(queries_path).read_text().splitlines() if l.strip()]
+    validate_assets(c, queries, json.loads(Path(truth_path).read_text()), query_float32_sha256(queries))
 
 
 def foreign_active(pods, owned_uids):
@@ -209,8 +223,7 @@ def main():
     a = p.parse_args(); c = json.loads(a.contract.read_text()); validate_contract(c)
     if a.command == "validate-assets":
         require(a.queries and a.truth, "--queries and --truth required")
-        qs = [json.loads(l) for l in a.queries.read_text().splitlines() if l.strip()]
-        validate_assets(c, qs, json.loads(a.truth.read_text()), sha256(a.queries))
+        validate_asset_files(c, a.queries, a.truth)
         print("ASSETS_OK")
         return
     placeholder = [0.0] * c["dimension"]

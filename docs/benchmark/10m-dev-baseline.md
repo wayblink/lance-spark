@@ -60,7 +60,7 @@ stdlib并发workers4；先红后绿，10个关键不变量覆盖：固定五格/
 - A1：`shai:~/runs/3255-pilot-a1`；pod `b3255-pilot-20261125033744-d500c8`，UID `fd6586c8-d637-4642-9bc1-32b71857858f`，cpu-1066，56s内ephemeral-storage驱逐，0query/0marker。JAR编译成功。
 - A2：`shai:~/runs/3255-pilot-a2`；pod `b3255-pilot-20261125034009-43eefd`，UID `da7eda9b-fbfb-4659-b587-30589a632f89`，cpu-1001，65s内同类驱逐，0query/0marker。
 - A3：`shai:~/runs/3255-pilot-a3`；pod `b3255-pilot-20261125034359-6a505a`，UID `084d3888-348a-402c-868a-f0e85a74af30`；指定cpu-0149但有sriov特殊taint，Pending/Unschedulable，0query；root明确要求UID取消后记录 `UNSCHEDULABLE_INFRA`，保留describe/events/ledger。
-- A4：用户明确额外授权，指定已只读核Ready/DiskPressureFalse/无taint的cpu-1122；输出 `shai:~/runs/3255-pilot-a4`。结果待收；无A5自动重试、无B/C隐式授权。
+- A4：用户明确额外授权，指定已只读核Ready/DiskPressureFalse/无taint的cpu-1122；输出 `shai:~/runs/3255-pilot-a4`。pod `b3255-pilot-20261125035654-2df8ef`，UID `5792cfcf-bcef-42ca-a7d5-bc9d0a9e1925`，140.1s后Succeeded，进程exit0，9条BASEPILOT标记：3query单查与真batch30行逐query完全一致；2fragment exact grouped/local merge/takeRows映射全部PASS。收取Spark eventlog1,241,660B，AppID `spark-b322f4dab2fd4cf39c1f60945e54b161`，executor-added事件12条（4core/个），经历executor更换，不能当健康独占性能窗口。driver SDK flat诊断cache0不代表SQL executor缓存。无正式truth/五组、无A5自动重试、无B/C隐式授权。
 
 ## 向用户请示的预算（不是实测承诺）
 

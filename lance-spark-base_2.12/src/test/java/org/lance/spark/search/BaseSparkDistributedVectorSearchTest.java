@@ -476,6 +476,7 @@ public abstract class BaseSparkDistributedVectorSearchTest {
    */
   @Test
   void batchQueryIdsAreInputPositionsNotBusinessIds() {
+    assumeNamedArguments();
     String table = createFiveFragmentTable();
     String queries = CATALOG_NAME + ".default.chunk_queries";
     spark.sql("DROP TABLE IF EXISTS " + queries + " PURGE");
@@ -545,6 +546,7 @@ public abstract class BaseSparkDistributedVectorSearchTest {
    */
   @Test
   void aNullQueryVectorIsSkippedWithoutShiftingNumbering() {
+    assumeNamedArguments();
     String table = createFiveFragmentTable();
     String queries = CATALOG_NAME + ".default.null_vec_queries";
     spark.sql("DROP TABLE IF EXISTS " + queries + " PURGE");
@@ -579,6 +581,7 @@ public abstract class BaseSparkDistributedVectorSearchTest {
    */
   @Test
   void aChunkedBatchAnswersExactlyWhatAnUnchunkedBatchAnswers() throws Exception {
+    assumeNamedArguments();
     String table = createFiveFragmentTable();
     spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
     String sql =
@@ -634,6 +637,7 @@ public abstract class BaseSparkDistributedVectorSearchTest {
   /** Each query of a chunked batch must still equal what searching that vector alone answers. */
   @Test
   void everyQueryOfAChunkedBatchEqualsItsOwnSingleSearch() {
+    assumeNamedArguments();
     String table = createFiveFragmentTable();
     spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
     spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "112");
@@ -662,6 +666,7 @@ public abstract class BaseSparkDistributedVectorSearchTest {
   /** A batch of one query is still a batch: one query id, and chunking has nothing to cut. */
   @Test
   void aSingleQueryBatchStillCarriesItsQueryId() {
+    assumeNamedArguments();
     String table = createFiveFragmentTable();
     spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
     spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "1");
@@ -685,6 +690,7 @@ public abstract class BaseSparkDistributedVectorSearchTest {
   /** k above the number of matching rows returns what exists, per query, without duplicating. */
   @Test
   void aChunkedBatchWithKLargerThanTheDataReturnsEachRowOnce() {
+    assumeNamedArguments();
     String table = createFiveFragmentTable();
     spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
     spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "1");
@@ -709,6 +715,7 @@ public abstract class BaseSparkDistributedVectorSearchTest {
   /** The plan text states the division, so an EXPLAIN shows why a batch opened several scans. */
   @Test
   void theScanDescriptionNamesTheChunkDivision() {
+    assumeNamedArguments();
     String table = createFiveFragmentTable();
     spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
     spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "112");
@@ -742,6 +749,17 @@ public abstract class BaseSparkDistributedVectorSearchTest {
       }
     }
     return ids;
+  }
+
+  /**
+   * Spark 3.4 table-valued functions have no named arguments, so the batch cases - which need
+   * {@code queries => ...} - cannot even be analyzed there. Same guard as the deferred-payload
+   * suite, which also builds its SQL from named arguments.
+   */
+  private void assumeNamedArguments() {
+    Assumptions.assumeFalse(
+        spark.version().startsWith("3.4."),
+        "Spark 3.4 table-valued functions do not support named arguments");
   }
 
   /** One query through the same distributed path, used as the reference for a batch member. */

@@ -29,6 +29,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -77,8 +78,16 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
     }
   }
 
+  /** Spark 3.4 table-valued functions have no named arguments, so those cases cannot run there. */
+  private void assumeNamedArguments() {
+    Assumptions.assumeFalse(
+        spark.version().startsWith("3.4."),
+        "Spark 3.4 table-valued functions do not support named arguments");
+  }
+
   @Test
   void singleQueryReturnsTheSameRowsThroughBothPlans() {
+    assumeNamedArguments();
     String table = createTable("single", 6);
     String sql =
         "SELECT id, name, _distance FROM VECTOR_SEARCH(table => '"
@@ -95,6 +104,7 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
 
   @Test
   void kLargerThanTheTableReturnsEveryRowThroughBothPlans() {
+    assumeNamedArguments();
     String table = createTable("klarge", 4);
     String sql =
         "SELECT id, name, _distance FROM VECTOR_SEARCH(table => '"
@@ -111,6 +121,7 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
 
   @Test
   void tiedDistancesKeepTheSameOrderAndRowIds() {
+    assumeNamedArguments();
     String table = CATALOG_NAME + ".default.ties";
     createTableSql(table);
     // Identical vectors in four fragments: every row ties on _distance, so only the row-id
@@ -141,6 +152,7 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
 
   @Test
   void offsetPagingAgreesBetweenBothPlans() {
+    assumeNamedArguments();
     String table = createTable("paging", 5);
     String page =
         "SELECT id, _distance FROM VECTOR_SEARCH(table => '"
@@ -154,6 +166,7 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
 
   @Test
   void nullablePayloadColumnsSurviveTheFetch() {
+    assumeNamedArguments();
     String table = CATALOG_NAME + ".default.nullable_payload";
     createTableSql(table);
     spark.sql(
@@ -178,6 +191,7 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
 
   @Test
   void deletedRowsAreInvisibleToBothPlans() {
+    assumeNamedArguments();
     String table = createTable("deleted", 5);
     spark.sql("DELETE FROM " + table + " WHERE id = 1");
     String sql =
@@ -197,9 +211,7 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
 
   @Test
   void batchQueryAgreesBetweenBothPlans() {
-    Assumptions.assumeFalse(
-        spark.version().startsWith("3.4."),
-        "Spark 3.4 table-valued functions do not support named arguments");
+    assumeNamedArguments();
     String table = createTable("batch", 6);
     String sql =
         "SELECT query_id, id, name, _distance FROM VECTOR_SEARCH(table => '"
@@ -216,6 +228,7 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
 
   @Test
   void smallFetchChunksReturnTheSameRows() {
+    assumeNamedArguments();
     String table = createTable("chunks", 6);
     String sql =
         "SELECT id, name, _distance FROM VECTOR_SEARCH(table => '"
@@ -235,6 +248,7 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
 
   @Test
   void emptyTableReturnsNoRowsThroughBothPlans() {
+    assumeNamedArguments();
     String table = CATALOG_NAME + ".default.empty_payload";
     createTableSql(table);
     String sql =
@@ -249,6 +263,7 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
 
   @Test
   void forcedDeferralShowsUpInThePlanAndOffKeepsTheFusedPlan() {
+    assumeNamedArguments();
     String table = createTable("plan", 3);
     String sql =
         "SELECT id, _distance FROM VECTOR_SEARCH(table => '"
@@ -266,6 +281,204 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
           "a deferred plan still read the payload column natively: " + deferredPlan);
     } finally {
       spark.conf().unset("spark.sql.adaptive.enabled");
+    }
+  }
+
+  @Test
+  void positionalSearchWithoutColumnsFetchesEveryDeclaredPayloadColumn() {
+    // No `columns` argument: the deferred path has to fetch the whole declared row, vector column
+    // included. That is the shape the frozen benchmark queries use, and it is the one where a
+    // request can get large. Positional form so this also runs on Spark 3.4.
+    String table = createTable("no_columns", 5);
+    String sql =
+        "SELECT * FROM VECTOR_SEARCH('"
+            + table
+            + "', array(0.0, 0.0, 0.0, 0.0), 4) ORDER BY _distance, id";
+
+    List<Row> fused = collect(sql, "off");
+    List<Row> deferred = collect(sql, "force");
+
+    assertEquals(4, fused.size());
+    assertEquals(rowsAsString(fused), rowsAsString(deferred));
+    for (Row row : deferred) {
+      assertEquals(4, row.size(), "id, vector, name and _distance");
+      assertEquals(4, row.getList(1).size(), "the vector payload must survive the fetch");
+    }
+  }
+
+  @Test
+  void aRealQueryIndexColumnIsFetchedNotClobbered() {
+    assumeNamedArguments();
+    // `query_index` is only the batch's internal column. In a single-query search a real column of
+    // that name is payload, and it must come back with its stored values instead of the 0 the
+    // internal column would contribute.
+    String table = CATALOG_NAME + ".default.query_index_column";
+    spark.sql(
+        "CREATE TABLE "
+            + table
+            + " (id INT NOT NULL, query_index INT NOT NULL, vector ARRAY<FLOAT> NOT NULL) "
+            + "USING lance TBLPROPERTIES ('vector.arrow.fixed-size-list.size' = '4')");
+    for (int fragment = 0; fragment < 4; fragment++) {
+      int start = fragment * 2;
+      spark.sql(
+          "INSERT INTO "
+              + table
+              + " SELECT CAST(id AS INT), CAST(id + 1000 AS INT),"
+              + " array(CAST(id AS FLOAT), CAST(id AS FLOAT), CAST(id AS FLOAT),"
+              + " CAST(id AS FLOAT)) FROM range("
+              + start
+              + ", "
+              + (start + 2)
+              + ", 1, 1)");
+    }
+    String sql =
+        "SELECT id, query_index, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_vector => array(0.0, 0.0, 0.0, 0.0), k => 4, "
+            + "columns => array('id', 'query_index')) ORDER BY _distance, id";
+
+    List<Row> fused = collect(sql, "off");
+    List<Row> deferred = collect(sql, "force");
+
+    assertEquals(rowsAsString(fused), rowsAsString(deferred));
+    for (Row row : deferred) {
+      assertEquals(
+          row.getInt(0) + 1000, row.getInt(1), "the real query_index value must be fetched");
+    }
+  }
+
+  @Test
+  void notNullPayloadColumnsStayNotNullable() {
+    assumeNamedArguments();
+    String table = createTable("nullability", 2);
+    String sql =
+        "SELECT id FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_vector => array(0.0, 0.0, 0.0, 0.0), k => 2, columns => array('id'))";
+
+    spark.conf().set(MODE_CONF, "off");
+    boolean fusedNullable = spark.sql(sql).schema().apply("id").nullable();
+    spark.conf().set(MODE_CONF, "force");
+    boolean deferredNullable = spark.sql(sql).schema().apply("id").nullable();
+
+    assertFalse(fusedNullable, "the fixture column is NOT NULL");
+    assertEquals(
+        fusedNullable,
+        deferredNullable,
+        "a deferred fetch must not report a NOT NULL payload column as nullable");
+  }
+
+  @Test
+  void forcedDeferralRejectsAPayloadColumnItCannotFetchByRowId() {
+    assumeNamedArguments();
+    String table = CATALOG_NAME + ".default.nested_payload";
+    spark.sql(
+        "CREATE TABLE "
+            + table
+            + " (id INT NOT NULL, meta STRUCT<a: INT>, vector ARRAY<FLOAT> NOT NULL) USING lance "
+            + "TBLPROPERTIES ('vector.arrow.fixed-size-list.size' = '4')");
+    spark.sql(
+        "INSERT INTO "
+            + table
+            + " SELECT CAST(id AS INT), named_struct('a', CAST(id AS INT)),"
+            + " array(CAST(id AS FLOAT), CAST(id AS FLOAT), CAST(id AS FLOAT),"
+            + " CAST(id AS FLOAT)) FROM range(0, 4, 1, 2)");
+    String sql =
+        "SELECT id, meta, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_vector => array(0.0, 0.0, 0.0, 0.0), k => 2, "
+            + "columns => array('id', 'meta'))";
+
+    // A nested column does not round-trip through takeRows with the scan layout, so `force` says so
+    // instead of quietly running the fused plan the caller asked to avoid.
+    spark.conf().set(MODE_CONF, "force");
+    Exception error = assertThrows(Exception.class, () -> spark.sql(sql).collectAsList());
+    assertTrue(rootMessage(error).contains("cannot fetch payload column"), rootMessage(error));
+
+    // `auto` is allowed to fall back, and the fused plan still answers.
+    spark.conf().set(MODE_CONF, "auto");
+    assertEquals(2, spark.sql(sql).collectAsList().size());
+  }
+
+  private static String rootMessage(Throwable error) {
+    Throwable current = error;
+    while (current.getCause() != null) {
+      current = current.getCause();
+    }
+    return String.valueOf(current.getMessage());
+  }
+
+  @Test
+  void explainDoesNotExposeCredentialsOrObjectIdentity() {
+    assumeNamedArguments();
+    String table = createTable("explain", 2);
+    String sql =
+        "SELECT id, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_vector => array(0.0, 0.0, 0.0, 0.0), k => 2, columns => array('id'))";
+    spark.conf().set(MODE_CONF, "force");
+
+    StringBuilder plan = new StringBuilder();
+    for (Row row : spark.sql("EXPLAIN EXTENDED " + sql).collectAsList()) {
+      plan.append(row.getString(0)).append('\n');
+    }
+    String text = plan.toString();
+
+    assertTrue(text.contains("LanceFetchPayload([id]"), "the node must be visible in the plan");
+    assertFalse(text.contains("LanceSparkReadOptions"), "plan text leaked read options: " + text);
+    assertFalse(
+        text.contains("LanceFetchPayloadSource"),
+        "plan text leaked the credential holder: " + text);
+    assertFalse(text.contains("credentials=redacted"), "plan text printed the holder: " + text);
+    assertFalse(
+        java.util.regex.Pattern.compile("@[0-9a-f]{6,}").matcher(text).find(),
+        "plan text printed an object identity hash: " + text);
+  }
+
+  @Test
+  void theCredentialHolderNeverPrintsItsStorageOptions() {
+    java.util.Map<String, String> storage =
+        new java.util.HashMap<>(
+            java.util.Collections.singletonMap("aws_secret_access_key", "SENTINEL3258"));
+    LanceFetchPayloadSource source =
+        new LanceFetchPayloadSource(
+            org.lance.spark.LanceSparkReadOptions.from("file:///tmp/x.lance"),
+            storage,
+            "dir",
+            java.util.Collections.singletonMap("root", "/tmp"));
+
+    assertFalse(source.toString().contains("SENTINEL3258"), source.toString());
+    assertFalse(source.toString().contains("aws_secret_access_key"), source.toString());
+    assertTrue(source.toString().contains("redacted"), source.toString());
+  }
+
+  @Test
+  void deferredFetchRunsInsideAnAdaptiveExecution() {
+    assumeNamedArguments();
+    String table = createTable("aqe", 4);
+    String sql =
+        "SELECT id, name, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_vector => array(0.0, 0.0, 0.0, 0.0), k => 6, "
+            + "columns => array('id', 'name')) ORDER BY _distance, id";
+
+    spark.conf().set("spark.sql.adaptive.enabled", "true");
+    spark.conf().set(MODE_CONF, "force");
+    try {
+      org.apache.spark.sql.Dataset<Row> deferred = spark.sql(sql);
+      // The fetch collects its winners from inside the action and starts a second job there; with
+      // AQE the plan is wrapped, so this asserts the shape the nested job actually runs under.
+      assertTrue(
+          deferred.queryExecution().executedPlan()
+              instanceof org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec,
+          deferred.queryExecution().executedPlan().toString());
+      List<Row> rows = new ArrayList<>(deferred.collectAsList());
+      assertEquals(6, rows.size());
+      spark.conf().set(MODE_CONF, "off");
+      assertEquals(
+          rowsAsString(rows), rowsAsString(new ArrayList<>(spark.sql(sql).collectAsList())));
+    } finally {
+      spark.conf().set("spark.sql.adaptive.enabled", "true");
     }
   }
 

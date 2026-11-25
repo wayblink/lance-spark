@@ -15,7 +15,6 @@ package org.lance.spark.search
 
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, UnaryNode}
-import org.lance.spark.LanceSparkReadOptions
 
 /**
  * Materializes the payload columns of an already ranked search result by row id.
@@ -25,6 +24,10 @@ import org.lance.spark.LanceSparkReadOptions
  * adds the remaining columns of `columns` by fetching them from the same pinned snapshot, so the
  * per-unit copies of the payload never reach Spark's sort or exchange.
  *
+ * <p>Column identity is positional, not name-based: `narrowColumns` names the internal columns the
+ * child carries in order, so a real table column that happens to be called `query_index` cannot be
+ * mistaken for the batch's internal one.
+ *
  * <p>Choosing this shape is a cost decision made by [[LancePayloadDeferral]]; the fused plan reads
  * the payload inside the native search instead.
  */
@@ -32,8 +35,9 @@ case class LanceFetchPayload(
     child: LogicalPlan,
     columns: Seq[Attribute],
     fetched: Seq[Attribute],
-    readOptions: LanceSparkReadOptions,
-    initialStorageOptions: java.util.Map[String, String],
+    narrowColumns: Seq[String],
+    isBatch: Boolean,
+    source: LanceFetchPayloadSource,
     chunkRows: Int,
     pin: LanceSearchVersionPin)
   extends UnaryNode {
@@ -43,4 +47,8 @@ case class LanceFetchPayload(
   override protected def withNewChildInternal(newChild: LogicalPlan): LanceFetchPayload =
     copy(child = newChild)
 
+  /** Plan text names the columns and the chunk size only: no credentials, no object identity. */
+  override def simpleString(maxFields: Int): String =
+    s"LanceFetchPayload(${fetched.map(_.name).mkString("[", ", ", "]")}, " +
+      s"narrow=${narrowColumns.mkString("[", ", ", "]")}, batch=$isBatch, chunkRows=$chunkRows)"
 }

@@ -16,7 +16,7 @@ package org.lance.spark.search
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedStar}
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, Cast, CreateArray, CurrentRow, Descending, Expression, LessThanOrEqual, Literal, NamedExpression, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, CreateArray, CurrentRow, Descending, Expression, LessThanOrEqual, Literal, NamedExpression, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, GlobalLimit, Limit, LocalLimit, LogicalPlan, Offset, Project, Sort, Window}
 import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
@@ -409,19 +409,27 @@ object LanceSearchTableFunctions {
       batchSchema.fields.filterNot(field => isRankingColumn(field.name, scanQuery.isBatch)).toSeq
     val candidates =
       scanQuery.getK.longValue() * math.max(scanQuery.getQueryCount().toLong, 1L)
-    // A nested payload column cannot be deferred safely: takeRows returns the stored struct, while
-    // the scan schema may carry widened child fields, so the two Arrow layouts could disagree.
-    val deferrablePayload = payloadFields.forall(isDeferrablePayload)
-    val deferral =
-      if (deferrablePayload) {
-        LancePayloadDeferral.plan(
-          SparkSession.active,
-          batchSchema,
-          payloadFields.map(_.name),
-          candidates)
+    // The internal ranking columns the child carries, in the order the ranking plan exposes them.
+    val narrowColumns =
+      if (scanQuery.isBatch) {
+        Seq(QueryIndexColumn, DistanceMetricColumn, RowIdColumn)
       } else {
-        None
+        Seq(DistanceMetricColumn, RowIdColumn)
       }
+    // A payload column cannot be deferred when takeRows would not round-trip it (nested layout) or
+    // when its name collides with a narrow column, which would make the two indistinguishable.
+    val unsupportedPayload =
+      payloadFields.filter { field =>
+        !isDeferrablePayload(field) ||
+        narrowColumns.exists(_.equalsIgnoreCase(field.name))
+      }.map(_.name)
+    val deferral =
+      LancePayloadDeferral.plan(
+        SparkSession.active,
+        batchSchema,
+        payloadFields.map(_.name),
+        candidates,
+        unsupportedPayload)
 
     // The scan pins the snapshot while it plans; the fetch node reads that pin afterwards so the
     // payload comes from the version the search actually saw.
@@ -461,6 +469,7 @@ object LanceSearchTableFunctions {
           winners,
           batchSchema,
           payloadFields.map(_.name),
+          narrowColumns,
           settings,
           scanQuery,
           resolved,
@@ -527,6 +536,7 @@ object LanceSearchTableFunctions {
       winners: LogicalPlan,
       outputSchema: StructType,
       payloadNames: Seq[String],
+      narrowColumns: Seq[String],
       settings: LancePayloadDeferral.Settings,
       query: LanceSearchQuery,
       resolved: ResolvedLanceTable,
@@ -537,20 +547,29 @@ object LanceSearchTableFunctions {
     // them, because the placeholder references no input column.
     val childProjection: Seq[NamedExpression] = outputSchema.fields.map { field =>
       if (payloadNames.contains(field.name)) {
-        Alias(Cast(Literal(null), field.dataType), field.name)(): NamedExpression
+        Alias(
+          LancePayloadPlaceholder(field.name, field.dataType, field.nullable),
+          field.name)(): NamedExpression
       } else {
         columnOf(winners, field.name)
       }
     }.toSeq
     val child = Project(childProjection, winners)
+    // The placeholder carries the declared data type and nullability, so the node's output can
+    // simply mirror the child: a NOT NULL payload column stays NOT NULL.
     val columns = child.output
     val fetched = columns.filter(column => payloadNames.contains(column.name))
     LanceFetchPayload(
       child,
       columns,
       fetched,
-      query.getReadOptions,
-      resolved.table.getInitialStorageOptions,
+      narrowColumns,
+      query.isBatch,
+      new LanceFetchPayloadSource(
+        query.getReadOptions,
+        resolved.table.getInitialStorageOptions,
+        query.getNamespaceImpl,
+        query.getNamespaceProperties),
       settings.chunkRows,
       versionPin)
   }
@@ -606,42 +625,6 @@ object LanceSearchTableFunctions {
 
     val rankColumn = columnOf(ranking, BatchRankColumn)
     Filter(LessThanOrEqual(rankColumn, Literal(k)), ranking)
-  }
-
-  /**
-   * The global top-k of every query: each unit returns its own top k per query, and the merge has
-   * to keep k per query rather than k overall, so the rows are ranked inside their query first.
-   * Row id breaks ties the way lance-core does (by `_distance`, then row id), and the query index
-   * becomes the leading `query_id` column the caller sees.
-   */
-  private def batchRelation(
-      rel: LogicalPlan,
-      limited: LogicalPlan,
-      schema: StructType,
-      wantsRowId: Boolean): LogicalPlan = {
-    def internalColumn(name: String) =
-      rel.output
-        .find(attr => attr.name == name)
-        .getOrElse {
-          throw new IllegalStateException(
-            s"Internal column ${name} is missing from a batch vector_search plan.")
-        }
-
-    val ranking =
-      Window(
-        Seq(Alias(RowNumber(), BatchRankColumn)()),
-        Seq(internalColumn(QueryIndexColumn)),
-        Seq(
-          SortOrder(internalColumn(DistanceMetricColumn), Ascending),
-          SortOrder(internalColumn(RowIdColumn), Ascending)),
-        limited)
-
-    val withinK = Filter(
-      LessThanOrEqual(
-        internalColumn(BatchRankColumn),
-        Literal(schema.fields.headOption.map(_ => 0).getOrElse(0))),
-      ranking)
-    withinK
   }
 
   private def shouldUseDistributed(query: LanceSearchQuery): Boolean = {

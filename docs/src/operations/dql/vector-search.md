@@ -199,38 +199,52 @@ through Spark's sort or exchange.
 | Value | Behaviour |
 | --- | --- |
 | `off` (default) | Fused only: the native search reads payload inside every unit. |
-| `auto` | Defer when one unit's estimated payload volume (`num_results x queries x row width`) reaches `spark.sql.lance.search.payload.deferral.min.bytes` (default 32 MiB). |
-| `force` | Defer whenever the result carries a payload column, for comparing both shapes on the same data. |
+| `auto` | Defer when one unit's estimated payload volume (`num_results x queries x row width`) reaches `spark.sql.lance.search.payload.deferral.min.bytes` (default 32 MiB). A payload column that cannot be fetched by row id falls back to the fused plan with a warning. |
+| `force` | Defer whenever the result carries a payload column, and **fail** if one of them cannot be fetched by row id instead of quietly running the fused plan. |
 
 With deferral, each unit reads only `_distance` and `_rowid` (plus `query_index` for a batch), Spark
 ranks the candidates exactly as before, and the payload for the winners is then read by stable row
 id at the **pinned snapshot** the search ran on. The second phase is chunked:
-`spark.sql.lance.search.payload.deferral.chunk.rows` (default 1024) bounds the rows per fetch task,
-and an internal 16 MiB budget lowers that further for wide rows, because `Dataset.takeRows` builds
-one Arrow IPC response in memory per call. The plan shows `LanceFetchPayload` with the columns it
-fetches; `EXPLAIN` therefore tells you which shape ran.
+`spark.sql.lance.search.payload.deferral.chunk.rows` (default 1024) caps the rows per fetch request,
+and the request is also bounded to about 16 MiB of payload measured from the dataset's **real Arrow
+schema** - a 2560-dimensional vector column costs 10 KiB per row, so a wide payload automatically
+gets fewer rows per request while a narrow one keeps the configured cap.
 
-Two properties are worth knowing before turning it on. The fetch verifies every returned `_rowid`
-against the requested one and fails the task on a mismatch, because lance-core silently drops a row
-id that is not in the snapshot and a positional mapping would attach payload to the wrong row. And
-retries are safe: a fetch task re-reads its chunk from the pinned snapshot, so a retried task
-returns the same rows.
+A payload column cannot be deferred when `Dataset.takeRows` would not round-trip it: a nested
+`struct`/`map` column (the scan schema may carry widened child fields, so the two Arrow layouts can
+disagree) or a column whose name collides with an internal ranking column. `force` reports those
+columns by name; `auto` falls back to the fused plan.
+
+The fetch opens the dataset the way the search tasks do, including the executor-side namespace
+credential refresh, so a long fetch does not run on a token that expired during the first phase. It
+verifies every returned `_rowid` against the requested one and fails the task on a mismatch, because
+lance-core silently drops a row id that is not in the snapshot and a positional mapping would attach
+payload to the wrong row. A retried fetch task re-reads its chunk from the pinned snapshot, so it
+returns the same rows. The plan shows `LanceFetchPayload([columns], narrow=[...], batch=...,
+chunkRows=...)`, which makes the choice visible in `EXPLAIN`; credentials are kept out of that text.
+The node does not publish an ordering, so an outer `ORDER BY` still sorts.
 
 #### When it is not faster
 
 - Small `num_results` with a narrow projection: the fused plan already reads very little, and the
   deferral adds a second dataset open plus a random-access pass.
 - A single searchable unit: nothing is amplified, so the deferral only adds the second read.
-- Payload that the query does not need but the TVF still declares: the deferred fetch reads the
-  columns the TVF declares (`columns => ...`, or the whole table when the argument is omitted), not
-  the subset a narrower outer `SELECT` picks. Pass `columns => array(...)` so the deferred arm reads
-  only what it needs.
+- Payload the query does not need but the TVF still declares: the deferred fetch reads the columns
+  the TVF declares (`columns => ...`, or the whole table when the argument is omitted), not the
+  subset a narrower outer `SELECT` picks. Omitting `columns` therefore makes the fetch read the
+  vector column too - usable as a diagnostic, not as the recommended shape: pass
+  `columns => array(...)` so deferred and fused read the same payload.
 - A table whose rows are scattered over many fragments: `takeRows` has to touch every fragment that
   holds a winner, so random access can cost more than the sequential per-unit reads it replaces.
 
 `auto` is a planning heuristic, not a measurement: it knows the declared projection and
 `num_results` but not how many units the dataset will produce. Keep `off` unless a workload is wide
 and multi-segment, and re-check recall and latency after enabling it.
+
+The pinned snapshot is recorded while the search scan plans, once per materialization. Two
+concurrent actions on the *same* `VECTOR_SEARCH` DataFrame in one session can therefore interleave
+their planning and let one fetch read the other's snapshot; run such actions sequentially (or issue
+separate queries) if they must be independent.
 
 ## Validation
 

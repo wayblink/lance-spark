@@ -14,13 +14,17 @@
 package org.lance.spark.search;
 
 import org.lance.Dataset;
-import org.lance.spark.LanceSparkReadOptions;
+import org.lance.spark.internal.ExecutorNamespace;
 import org.lance.spark.utils.Utils;
 import org.lance.spark.vectorized.LanceArrowColumnVector;
 
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.DateUnit;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
@@ -51,8 +55,13 @@ import java.util.NoSuchElementException;
  * the requested order, duplicates included, but it <em>silently drops</em> a row id that is not in
  * the snapshot - so a positional mapping would shift every later row onto the wrong payload. {@code
  * _rowid} is therefore requested next to the payload and every returned row id is compared with the
- * one asked for; a mismatch fails the task instead of producing wrong rows. The fetch is chunked by
- * the caller so the Arrow IPC buffer one call builds stays bounded.
+ * one asked for; a mismatch fails the task instead of producing wrong rows.
+ *
+ * <p>Request size is bounded in bytes, not only in rows: {@code takeRows} returns one complete
+ * Arrow IPC {@code byte[]} per call, so a request is sized from the dataset's real Arrow schema (a
+ * 2560 dimensional vector column is 10 KiB per row, not the 1 KiB a Spark-ArrayType estimate
+ * suggests). The estimate is per requested field; a variable-width column is charged a nominal
+ * width and the configured row count remains the hard cap.
  */
 public final class LancePayloadFetcher implements Serializable {
   private static final long serialVersionUID = 748193927461839271L;
@@ -60,10 +69,25 @@ public final class LancePayloadFetcher implements Serializable {
   /** The column {@link #fetch} asks for in addition to the payload, to verify the mapping. */
   public static final String ROW_ID_COLUMN = "_rowid";
 
-  private final LanceSparkReadOptions readOptions;
-  private final Map<String, String> initialStorageOptions;
+  /**
+   * Upper bound on the payload bytes one {@code takeRows} request asks lance-core for. The native
+   * call builds the whole response as one {@code byte[]}, so this is the memory bound of a fetch
+   * request, not a tuning knob.
+   */
+  public static final long ChunkBytes = 16L * 1024 * 1024;
+
+  /** Nominal width charged for a variable-width payload column when sizing a request. */
+  private static final long VariableWidthNominal = 128L;
+
+  /** Nominal width charged for a nested or collection payload column when sizing a request. */
+  private static final long NestedNominal = 1024L;
+
+  private final LanceFetchPayloadSource source;
   private final StructType schema;
   private final List<String> payloadColumns;
+  private final List<String> narrowColumns;
+  private final int maxRowsPerRequest;
+  private final LancePayloadMetrics metrics;
 
   /** Schema positions and fields of the narrow (ranking) columns, in schema order. */
   private final int[] narrowPositions;
@@ -71,32 +95,46 @@ public final class LancePayloadFetcher implements Serializable {
   private final StructField[] narrowFields;
 
   /**
-   * @param readOptions the options the search planned with; they must carry the version the search
-   *     ran on, not "latest"
+   * @param source the pinned read options, credentials and namespace used to reopen the dataset
    * @param schema the full output schema, in the order the caller declared it
    * @param payloadColumns the columns of {@code schema} this fetcher materializes, in schema order
+   * @param narrowColumns the internal columns the search produced, in schema order; matching is by
+   *     name against an explicit list, so a real table column called {@code query_index} is treated
+   *     as payload
+   * @param maxRowsPerRequest cap on rows per {@code takeRows} request; the byte budget can lower it
    */
   public LancePayloadFetcher(
-      LanceSparkReadOptions readOptions,
-      Map<String, String> initialStorageOptions,
+      LanceFetchPayloadSource source,
       StructType schema,
-      List<String> payloadColumns) {
-    this.readOptions = readOptions;
-    this.initialStorageOptions =
-        initialStorageOptions == null
-            ? Collections.emptyMap()
-            : Collections.unmodifiableMap(new HashMap<>(initialStorageOptions));
+      List<String> payloadColumns,
+      List<String> narrowColumns,
+      int maxRowsPerRequest,
+      LancePayloadMetrics metrics) {
+    this.source = source;
     this.schema = schema;
     this.payloadColumns = Collections.unmodifiableList(new ArrayList<>(payloadColumns));
+    this.narrowColumns = Collections.unmodifiableList(new ArrayList<>(narrowColumns));
+    this.maxRowsPerRequest = Math.max(maxRowsPerRequest, 1);
+    this.metrics = metrics;
 
     StructField[] fields = schema.fields();
     List<Integer> positions = new ArrayList<>();
     List<StructField> narrow = new ArrayList<>();
     for (int position = 0; position < fields.length; position++) {
-      if (isNarrowColumn(fields[position].name())) {
+      if (isNarrow(fields[position].name())) {
         positions.add(position);
         narrow.add(fields[position]);
       }
+    }
+    if (positions.size() != narrowColumns.size()) {
+      throw new IllegalStateException(
+          "deferred payload fetch got narrow columns "
+              + narrowColumns
+              + " but the schema "
+              + schema
+              + " contains "
+              + positions.size()
+              + " of them");
     }
     this.narrowPositions = new int[positions.size()];
     for (int i = 0; i < positions.size(); i++) {
@@ -110,8 +148,71 @@ public final class LancePayloadFetcher implements Serializable {
   }
 
   /**
+   * Rows one {@code takeRows} request may ask for, given the dataset's real Arrow schema: the
+   * configured cap, lowered until the estimated response fits {@link #ChunkBytes}.
+   */
+  public static int rowsPerRequest(Schema arrowSchema, List<String> payloadColumns, int cap) {
+    long width = 8L; // the _rowid column the fetch adds to verify the mapping
+    for (String name : payloadColumns) {
+      width += fieldWidth(arrowSchema == null ? null : arrowSchema.findField(name));
+    }
+    long byBytes = Math.max(1L, ChunkBytes / Math.max(width, 1L));
+    return (int) Math.max(1L, Math.min(Math.max(cap, 1), byBytes));
+  }
+
+  private static long fieldWidth(Field field) {
+    if (field == null) {
+      return NestedNominal;
+    }
+    ArrowType type = field.getType();
+    if (type instanceof ArrowType.Int) {
+      return Math.max(1L, ((ArrowType.Int) type).getBitWidth() / 8L);
+    }
+    if (type instanceof ArrowType.FloatingPoint) {
+      switch (((ArrowType.FloatingPoint) type).getPrecision()) {
+        case HALF:
+          return 2L;
+        case SINGLE:
+          return 4L;
+        default:
+          return 8L;
+      }
+    }
+    if (type instanceof ArrowType.Bool) {
+      return 1L;
+    }
+    if (type instanceof ArrowType.FixedSizeBinary) {
+      return Math.max(1L, ((ArrowType.FixedSizeBinary) type).getByteWidth());
+    }
+    if (type instanceof ArrowType.Decimal) {
+      return 16L;
+    }
+    if (type instanceof ArrowType.Date) {
+      return ((ArrowType.Date) type).getUnit() == DateUnit.DAY ? 4L : 8L;
+    }
+    if (type instanceof ArrowType.Timestamp
+        || type instanceof ArrowType.Time
+        || type instanceof ArrowType.Duration) {
+      return 8L;
+    }
+    if (type instanceof ArrowType.Utf8 || type instanceof ArrowType.Binary) {
+      return VariableWidthNominal;
+    }
+    if (type instanceof ArrowType.FixedSizeList) {
+      long size = ((ArrowType.FixedSizeList) type).getListSize();
+      long element =
+          field.getChildren().isEmpty()
+              ? VariableWidthNominal
+              : fieldWidth(field.getChildren().get(0));
+      return Math.max(1L, size * element);
+    }
+    return NestedNominal;
+  }
+
+  /**
    * Returns the payload for one chunk of winners, as columnar batches that carry every column of
-   * {@code schema}. Batches are produced lazily so at most one Arrow batch is held at a time.
+   * {@code schema}, in the requested order. Requests are split so one response stays bounded; the
+   * dataset is opened once per chunk and closed when the iterator is exhausted.
    */
   public Iterator<ColumnarBatch> fetch(
       final long[] rowIds, final float[] distances, final int[] queryIndexes) {
@@ -130,26 +231,96 @@ public final class LancePayloadFetcher implements Serializable {
       return narrowOnly(rowIds, distances, queryIndexes);
     }
 
-    Dataset opened = null;
-    ArrowReader arrowReader = null;
+    final Dataset dataset;
+    final ExecutorNamespace executorNamespace;
     try {
-      opened =
-          Utils.openDatasetBuilder(readOptions)
-              .initialStorageOptions(initialStorageOptions)
+      // Same credential handling as the search tasks: a long fetch must not run on an STS token
+      // that expired while the first phase was scanning.
+      executorNamespace =
+          ExecutorNamespace.acquire(
+              source.readOptions(), source.namespaceImpl(), source.namespaceProperties());
+      dataset =
+          Utils.openDatasetBuilder(source.readOptions())
+              .initialStorageOptions(source.initialStorageOptions())
               .build();
-      arrowReader = opened.takeRows(boxedRowIds(rowIds), requestedColumns());
-    } catch (IOException | RuntimeException e) {
-      closeQuietly(arrowReader, opened);
+    } catch (RuntimeException e) {
       throw new IllegalStateException(
-          "Failed to read deferred search payload for " + rowIds.length + " row ids", e);
+          "Failed to open the dataset for the deferred search payload of "
+              + rowIds.length
+              + " row ids",
+          e);
     }
 
-    final Dataset dataset = opened;
-    final ArrowReader reader = arrowReader;
-    final int[] narrowPositions = this.narrowPositions;
-    final StructField[] narrowFields = this.narrowFields;
-    final StructField[] fields = schema.fields();
+    final int requests = rowsPerRequest(dataset.getSchema(), payloadColumns, maxRowsPerRequest);
+    final List<String> requestedColumns = requestedColumns();
 
+    return new Iterator<ColumnarBatch>() {
+      private int windowStart;
+      private Iterator<ColumnarBatch> window = Collections.emptyIterator();
+      private boolean closed;
+
+      @Override
+      public boolean hasNext() {
+        while (!window.hasNext()) {
+          if (windowStart >= rowIds.length) {
+            close();
+            return false;
+          }
+          int count = Math.min(requests, rowIds.length - windowStart);
+          window =
+              request(
+                  rowIds, distances, queryIndexes, windowStart, count, requestedColumns, dataset);
+          windowStart += count;
+        }
+        return true;
+      }
+
+      @Override
+      public ColumnarBatch next() {
+        if (!hasNext()) {
+          throw new NoSuchElementException("no more deferred search payload batches");
+        }
+        return window.next();
+      }
+
+      private void close() {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        try {
+          dataset.close();
+        } finally {
+          executorNamespace.close();
+        }
+      }
+    };
+  }
+
+  /** One {@code takeRows} request: reads {@code count} row ids starting at {@code start}. */
+  private Iterator<ColumnarBatch> request(
+      final long[] rowIds,
+      final float[] distances,
+      final int[] queryIndexes,
+      final int start,
+      final int count,
+      final List<String> requestedColumns,
+      final Dataset dataset) {
+    final List<Long> ids = new ArrayList<>(count);
+    for (int i = 0; i < count; i++) {
+      ids.add(rowIds[start + i]);
+    }
+    final ArrowReader reader;
+    try {
+      reader = dataset.takeRows(ids, requestedColumns);
+    } catch (IOException | RuntimeException e) {
+      throw new IllegalStateException(
+          "Failed to read deferred search payload for " + count + " row ids starting at " + start,
+          e);
+    }
+    if (metrics != null) {
+      metrics.add(1, 0L, 0L);
+    }
     return new Iterator<ColumnarBatch>() {
       private int position;
       private ColumnarBatch next;
@@ -169,12 +340,12 @@ public final class LancePayloadFetcher implements Serializable {
           throw new IllegalStateException("Failed to read deferred search payload", e);
         }
         if (next == null) {
-          if (position != rowIds.length) {
+          if (position != count) {
             String message =
                 "Deferred payload fetch returned "
                     + position
                     + " rows for "
-                    + rowIds.length
+                    + count
                     + " row ids; the search and the fetch may be reading different snapshots";
             close();
             throw new IllegalStateException(message);
@@ -205,13 +376,13 @@ public final class LancePayloadFetcher implements Serializable {
         if (rows == 0) {
           return new ColumnarBatch(new ColumnVector[0], 0);
         }
-        if (position + rows > rowIds.length) {
+        if (position + rows > count) {
           close();
           throw new IllegalStateException(
               "Deferred payload fetch returned more rows than requested: "
                   + (position + rows)
                   + " > "
-                  + rowIds.length);
+                  + count);
         }
         Map<String, FieldVector> payloadFields = new HashMap<>();
         FieldVector returnedRowIds = null;
@@ -227,8 +398,9 @@ public final class LancePayloadFetcher implements Serializable {
           throw new IllegalStateException(
               "Deferred payload fetch did not return " + ROW_ID_COLUMN + " to verify row identity");
         }
+        long decodedBytes = 0L;
         for (int row = 0; row < rows; row++) {
-          long expected = rowIds[position + row];
+          long expected = rowIds[start + position + row];
           long actual = ((Number) returnedRowIds.getObject(row)).longValue();
           if (expected != actual) {
             close();
@@ -238,16 +410,38 @@ public final class LancePayloadFetcher implements Serializable {
                     + " where "
                     + expected
                     + " was requested (offset "
-                    + (position + row)
+                    + (start + position + row)
                     + "); refusing to attach payload by array position");
           }
         }
 
         OnHeapColumnVector[] narrow = OnHeapColumnVector.allocateColumns(rows, narrowFields);
         for (int i = 0; i < narrow.length; i++) {
-          fillNarrow(narrow[i], narrowFields[i].name(), rows);
+          String name = narrowFields[i].name();
+          switch (name) {
+            case LanceSearchProjection.DISTANCE_COLUMN:
+              for (int row = 0; row < rows; row++) {
+                narrow[i].putFloat(row, distances[start + position + row]);
+              }
+              break;
+            case ROW_ID_COLUMN:
+              for (int row = 0; row < rows; row++) {
+                narrow[i].putLong(row, rowIds[start + position + row]);
+              }
+              break;
+            case LanceSearchProjection.QUERY_INDEX:
+              for (int row = 0; row < rows; row++) {
+                narrow[i].putInt(row, queryIndexes[start + position + row]);
+              }
+              break;
+            default:
+              close();
+              throw new IllegalStateException(
+                  "Column '" + name + "' is not a narrow search column");
+          }
         }
 
+        StructField[] fields = schema.fields();
         ColumnVector[] vectors = new ColumnVector[fields.length];
         for (int i = 0; i < narrow.length; i++) {
           vectors[narrowPositions[i]] = narrow[i];
@@ -263,34 +457,15 @@ public final class LancePayloadFetcher implements Serializable {
             throw new IllegalStateException(
                 "Deferred payload fetch did not return column '" + name + "'");
           }
+          decodedBytes += field.getBufferSize();
           vectors[column] = new LanceArrowColumnVector(field, false);
         }
         ColumnarBatch sparkBatch = new ColumnarBatch(vectors, rows);
         position += rows;
-        return sparkBatch;
-      }
-
-      private void fillNarrow(OnHeapColumnVector vector, String name, int rows) {
-        switch (name) {
-          case LanceSearchProjection.DISTANCE_COLUMN:
-            for (int row = 0; row < rows; row++) {
-              vector.putFloat(row, distances[position + row]);
-            }
-            break;
-          case ROW_ID_COLUMN:
-            for (int row = 0; row < rows; row++) {
-              vector.putLong(row, rowIds[position + row]);
-            }
-            break;
-          case LanceSearchProjection.QUERY_INDEX:
-            for (int row = 0; row < rows; row++) {
-              vector.putInt(row, queryIndexes[position + row]);
-            }
-            break;
-          default:
-            close();
-            throw new IllegalStateException("Column '" + name + "' is not a narrow search column");
+        if (metrics != null) {
+          metrics.add(0, rows, decodedBytes);
         }
+        return sparkBatch;
       }
 
       private void close() {
@@ -298,25 +473,21 @@ public final class LancePayloadFetcher implements Serializable {
           return;
         }
         closed = true;
-        closeQuietly(reader, dataset);
+        try {
+          reader.close();
+        } catch (IOException ignored) {
+          // best effort: the response bytes are already in memory
+        }
       }
     };
   }
 
-  private boolean isNarrowColumn(String name) {
-    if (LanceSearchProjection.DISTANCE_COLUMN.equals(name) || ROW_ID_COLUMN.equals(name)) {
-      return true;
-    }
-    return LanceSearchProjection.QUERY_INDEX.equals(name);
+  private boolean isNarrow(String name) {
+    return narrowColumns.contains(name);
   }
 
   private boolean isQueryIndexConsistent(long[] rowIds, int[] queryIndexes) {
-    boolean batch = false;
-    for (StructField field : schema.fields()) {
-      if (LanceSearchProjection.QUERY_INDEX.equals(field.name())) {
-        batch = true;
-      }
-    }
+    boolean batch = narrowColumns.contains(LanceSearchProjection.QUERY_INDEX);
     return !batch || rowIds.length == queryIndexes.length;
   }
 
@@ -326,14 +497,6 @@ public final class LancePayloadFetcher implements Serializable {
       columns.add(ROW_ID_COLUMN);
     }
     return columns;
-  }
-
-  private static List<Long> boxedRowIds(long[] rowIds) {
-    List<Long> boxed = new ArrayList<>(rowIds.length);
-    for (long rowId : rowIds) {
-      boxed.add(rowId);
-    }
-    return boxed;
   }
 
   /** Emits only the narrow columns, for a plan whose payload columns were all pruned away. */
@@ -386,16 +549,7 @@ public final class LancePayloadFetcher implements Serializable {
     };
   }
 
-  private static void closeQuietly(ArrowReader reader, Dataset dataset) {
-    if (reader != null) {
-      try {
-        reader.close();
-      } catch (IOException ignored) {
-        // best effort: the response bytes are already in memory
-      }
-    }
-    if (dataset != null) {
-      dataset.close();
-    }
+  List<String> getPayloadColumns() {
+    return payloadColumns;
   }
 }

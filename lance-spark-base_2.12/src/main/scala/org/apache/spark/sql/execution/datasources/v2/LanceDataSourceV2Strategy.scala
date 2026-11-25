@@ -111,8 +111,9 @@ case class LanceDataSourceV2Strategy(session: SparkSession) extends SparkStrateg
         planLater(fetch.child),
         fetch.columns,
         fetch.fetched,
-        fetch.readOptions,
-        fetch.initialStorageOptions,
+        fetch.narrowColumns,
+        fetch.isBatch,
+        fetch.source,
         fetch.chunkRows,
         fetch.pin) :: Nil
 

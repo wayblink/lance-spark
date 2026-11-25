@@ -34,14 +34,15 @@ import java.util.Locale
  *
  * <ul>
  *   <li>`off` - always fused. The default until the tradeoff is measured on a cluster.
- *   <li>`auto` - defer when one unit's estimated payload volume reaches the threshold. With a
- *       single unit nothing is amplified and the deferral only adds a second read; a plan that
- *       small does not clear the default threshold.
- *   <li>`force` - defer whenever the result carries any payload column, for benchmarking the two
- *       shapes against each other on the same data.
+ *   <li>`auto` - defer when one unit's estimated payload volume reaches the threshold. A payload
+ *       column that cannot be fetched by row id makes it fall back to fused with a warning.
+ *   <li>`force` - defer whenever the result carries a payload column, and fail if one of them
+ *       cannot be fetched by row id instead of silently running the fused plan.
  * </ul>
  */
 object LancePayloadDeferral {
+  private val logger = org.slf4j.LoggerFactory.getLogger(getClass)
+
   val ModeConf = "spark.sql.lance.search.payload.deferral.mode"
   val MinBytesConf = "spark.sql.lance.search.payload.deferral.min.bytes"
   val ChunkRowsConf = "spark.sql.lance.search.payload.deferral.chunk.rows"
@@ -50,14 +51,7 @@ object LancePayloadDeferral {
   val DefaultMinBytes = 32L * 1024 * 1024
   val DefaultChunkRows = 1024
 
-  /**
-   * Upper bound on the payload bytes one fetch task asks lance-core for. `Dataset.takeRows` returns
-   * the whole response as one Arrow IPC `byte[]`, so the chunk has to be sized in bytes, not only in
-   * rows: a chunk is `min(chunk.rows, this / estimated row width)`.
-   */
-  val ChunkBytes = 16L * 1024 * 1024
-
-  /** Nominal widths for variable-length types, used only to size chunks and the decision. */
+  /** Nominal widths for variable-length types, used only to size the decision. */
   private val VariableWidthNominal = 128L
 
   /** Nominal width for a nested or collection column, likewise only a sizing estimate. */
@@ -68,12 +62,17 @@ object LancePayloadDeferral {
   /**
    * Returns the deferral settings when the payload should be fetched after ranking, or `None` for
    * the fused plan.
+   *
+   * @param unsupportedPayloadColumns payload columns that cannot be deferred (nested types, or a
+   *     name that collides with an internal ranking column). `force` fails on them; `auto` falls
+   *     back to fused and says why.
    */
   def plan(
       spark: SparkSession,
       schema: StructType,
       payloadColumns: Seq[String],
-      candidates: Long): Option[Settings] = {
+      candidates: Long,
+      unsupportedPayloadColumns: Seq[String]): Option[Settings] = {
     if (payloadColumns.isEmpty || candidates <= 0) {
       return None
     }
@@ -81,11 +80,25 @@ object LancePayloadDeferral {
     mode match {
       case "off" | "false" => None
       case "auto" | "true" =>
+        if (unsupportedPayloadColumns.nonEmpty) {
+          logger.warn(
+            "VECTOR_SEARCH keeps the fused payload plan: {} cannot be fetched by row id",
+            unsupportedPayloadColumns.mkString("[", ", ", "]"))
+          return None
+        }
         val threshold = spark.conf.get(MinBytesConf, DefaultMinBytes.toString).trim.toLong
         val width = estimatedPayloadWidth(schema, payloadColumns)
         val bytes = estimatedBytes(candidates, width)
         if (bytes >= threshold) Some(settings(spark, width, bytes)) else None
       case "force" | "always" =>
+        if (unsupportedPayloadColumns.nonEmpty) {
+          throw new IllegalArgumentException(
+            s"$ModeConf=force cannot fetch payload column(s) "
+              + unsupportedPayloadColumns.mkString("[", ", ", "]")
+              + " by row id: a nested column does not round-trip through Dataset.takeRows with the "
+              + "scan's Arrow layout, and a column named like an internal ranking column cannot be "
+              + "told apart from it. Rename the column or set $ModeConf=off to use the fused plan.")
+        }
         val width = estimatedPayloadWidth(schema, payloadColumns)
         Some(settings(spark, width, estimatedBytes(candidates, width)))
       case other =>
@@ -104,7 +117,13 @@ object LancePayloadDeferral {
     }
   }
 
-  /** Estimated in-memory width of one row of `payloadColumns`, from Spark types only. */
+  /**
+   * Estimated width of one row of `payloadColumns`, from Spark types only.
+   *
+   * <p>Used for the planning decision and the log line, not as the memory bound: a Spark
+   * `ArrayType` does not carry the fixed-size-list length, so a 2560 dimensional vector looks 10x
+   * smaller here than it is. The fetch sizes each request from the dataset's real Arrow schema.
+   */
   def estimatedPayloadWidth(schema: StructType, payloadColumns: Seq[String]): Long = {
     payloadColumns.foldLeft(0L) { (total, name) =>
       val field = schema.fields.find(_.name == name)
@@ -123,17 +142,9 @@ object LancePayloadDeferral {
     case _ => VariableWidthNominal
   }
 
-  /** Rows per fetch task: the configured row count, capped so one response stays under the budget. */
-  def chunkRows(configured: Int, rowWidth: Long): Int = {
-    val byBytes =
-      if (rowWidth <= 0) configured
-      else math.max(1L, ChunkBytes / rowWidth)
-    math.max(1, math.min(configured.toLong, byBytes).toInt)
-  }
-
+  /** Configured row cap for one fetch request; the fetcher lowers it from the real Arrow width. */
   private def settings(spark: SparkSession, width: Long, bytes: Long): Settings = {
     val configured = spark.conf.get(ChunkRowsConf, DefaultChunkRows.toString).trim.toInt
-    val chunk = chunkRows(configured, width)
-    Settings(chunk, width, bytes)
+    Settings(math.max(configured, 1), width, bytes)
   }
 }

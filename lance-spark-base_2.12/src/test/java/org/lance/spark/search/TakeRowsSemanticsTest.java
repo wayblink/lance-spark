@@ -241,6 +241,36 @@ class TakeRowsSemanticsTest {
   }
 
   @Test
+  void requestSizingUsesTheRealArrowWidthOfAVectorColumn() {
+    // A Spark ArrayType does not carry the fixed-size-list length, so it cannot be used to bound
+    // the response of takeRows; the dataset's Arrow schema can. 2560 float32 = 10240 bytes/row.
+    Schema arrowSchema =
+        new Schema(
+            Arrays.asList(
+                new Field(
+                    "vector",
+                    FieldType.nullable(new ArrowType.FixedSizeList(2560)),
+                    Collections.singletonList(
+                        new Field(
+                            "item",
+                            FieldType.nullable(
+                                new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)),
+                            null))),
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null)));
+
+    int rows =
+        LancePayloadFetcher.rowsPerRequest(arrowSchema, Arrays.asList("vector", "id"), 20000);
+
+    long perRow = 2560L * 4L + 4L + 8L;
+    assertTrue(rows <= LancePayloadFetcher.ChunkBytes / perRow, "requests must respect the budget");
+    assertTrue(rows > 1000, "a 10 KiB row still fits thousands of rows in 16 MiB, got " + rows);
+    assertEquals(
+        20000,
+        LancePayloadFetcher.rowsPerRequest(arrowSchema, Arrays.asList("id"), 20000),
+        "a narrow payload keeps the configured cap");
+  }
+
+  @Test
   void returnsEveryRowWhenAllRowIdsAreRequested() throws Exception {
     try (Dataset dataset = open()) {
       List<Long> rowIds = readRowIds(dataset);

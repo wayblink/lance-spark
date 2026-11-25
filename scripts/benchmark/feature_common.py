@@ -38,7 +38,7 @@ BASELINE_SHA256 = "a29c97557f178e877ff9c9d29c42dfd186e13ffce3fde250ef427520342a1
 # -- foreign benchmark activity is recorded, coverage/API/marker failures still void a cell -- and
 # the text BM25 k=10 cell added by card #3285). Anything else is refused before ssh.
 RUNNER_SHA256 = {
-    "submit.py": "7a3110bbcbf3d71b6ec636aae9fc25ed048642027a240c8e4fb12a96c96cce43",
+    "submit.py": "6bd8a34537fec43d5dbd4b83578bb0c32231a4e008c26ddf463c9b9b8ebaecd6",
     "baseline.py": "cbd7264fc9824b2456c379784d3e0385d02a96ad8a44bc8688ccab6a22531427",
     "pilot.py": "1e9f57b422cf98b98b62c87eb9c28d42b5f1c3931b5a026267389c4cedc1c9d7",
     "benchmark.py": "654c4b122daae926fa7ebdc98f092b58da04584a0d4a81af63b2154a690792c9",

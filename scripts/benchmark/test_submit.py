@@ -477,3 +477,40 @@ class CellLifecycleTests(unittest.TestCase):
         self.assertIs(verdict["baseline_valid"], True)
         self.assertIsNone(verdict["contamination"])
         self.assertEqual(verdict["foreign_observed"], [])
+
+class DoneMarkerFallbackTests(unittest.TestCase):
+    """A rotated driver log must not void a cell that provably finished."""
+
+    def _cell(self, tmp, exit_code, app_end):
+        root = Path(tmp)
+        (root / "spark-events").mkdir()
+        if app_end:
+            (root / "spark-events" / "app").write_text(
+                '{"Event":"SparkListenerApplicationEnd","Timestamp":1}\n')
+        container = {"state": {"terminated": {"exitCode": exit_code}}}
+        (root / "pod-latest.json").write_text(json.dumps(
+            {"status": {"containerStatuses": [container]}}))
+        return root
+
+    def test_exit_zero_with_app_end_proves_completion_without_the_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._cell(tmp, 0, True)
+            records = [{"kind": "single", "k": 10, "warmup": True, "qid": 0}]
+            observations = [{"at_ms": 1000, "api_ok": True, "foreign": []},
+                            {"at_ms": 2000, "api_ok": True, "foreign": []}]
+            self.assertTrue(submit._eventlog_has_app_end(root))
+            self.assertEqual(submit._pod_exit_code(root), 0)
+
+    def test_a_failed_exit_or_missing_app_end_is_not_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._cell(tmp, 1, True)
+            self.assertEqual(submit._pod_exit_code(root), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._cell(tmp, 0, False)
+            self.assertFalse(submit._eventlog_has_app_end(root))
+
+    def test_missing_evidence_files_are_reported_as_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(submit._pod_exit_code(root))
+            self.assertFalse(submit._eventlog_has_app_end(root))

@@ -215,6 +215,39 @@ def api_unhealthy(samples, observations):
     return False
 
 
+def _pod_exit_code(output):
+    """The driver container's own exit code from the captured pod json, or None when unknown."""
+    try:
+        pod=json.loads((Path(output)/"pod-latest.json").read_text())
+    except (OSError, ValueError):
+        return None
+    for status in pod.get("status",{}).get("containerStatuses",[]) or []:
+        code=(status.get("state",{}).get("terminated") or {}).get("exitCode")
+        if code is not None:
+            return code
+        code=(status.get("lastState",{}).get("terminated") or {}).get("exitCode")
+        if code is not None:
+            return code
+    return None
+
+
+def _eventlog_has_app_end(output):
+    """True when the captured Spark event log records a clean application end."""
+    root=Path(output)/"spark-events"
+    if not root.is_dir():
+        return False
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            text=path.read_text(errors="replace")
+        except OSError:
+            continue
+        if '"Event":"SparkListenerApplicationEnd"' in text or "SparkListenerApplicationEnd" in text:
+            return True
+    return False
+
+
 def cell_window(samples, observations, state, done_marker_present, api_unknown=False):
     """The single decision point for one cell.
 
@@ -572,11 +605,24 @@ def run_one_cell(ctx, kind, k, window_seconds):
         else: records=[]
         eventlog=any(p.is_file() for p in (output/"spark-events").rglob("*")) if (output/"spark-events").exists() else False
         expected_marker='BASELINE_DONE {"ok":true,"kind":"'+kind+'","k":'+str(k)+'}'
-        marker_present=logs is not None and expected_marker in logs.stdout
+        marker_in_log=logs is not None and expected_marker in logs.stdout
+        # kubelet rotates a driver's container log, so a cell that ran for a long time can come
+        # back with only its last lines and lose the marker even though the cell finished. The
+        # marker is a completion signal, not a data-quality check: accept the same fact from the
+        # pod's own exit status plus a SparkListenerApplicationEnd in the event log, and keep the
+        # evidence of which route proved it. Coverage, sample completeness and the exit status are
+        # unchanged requirements, so this cannot turn a half-run cell into a usable one.
+        marker_from_exit = bool(
+            state=="SUCCEEDED" and _pod_exit_code(output)==0
+            and _eventlog_has_app_end(output))
+        marker_present = marker_in_log or marker_from_exit
+        marker_source = "driver_log" if marker_in_log else (
+            "pod_exit+eventlog" if marker_from_exit else None)
         window_state=cell_window(records,observations,state=state,done_marker_present=marker_present,
                                  api_unknown=api_unknown)
         verdict={"kind":kind,"k":k,"pod":name,"uid":uid,"app":app,"state":state,
-                 "done_marker_present":marker_present,"eventlog_present":eventlog,
+                 "done_marker_present":marker_present,"done_marker_source":marker_source,
+                 "eventlog_present":eventlog,
                  "elapsed_seconds":time.monotonic()-start,"cache_residency":"unknown",
                  "window_wait_exhausted":window["exhausted"],
                  "cleanup":"own terminal pod retained as evidence"}

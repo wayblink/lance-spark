@@ -69,6 +69,13 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
 
   private final StructType schema;
   private final LanceSearchQuery query;
+
+  /**
+   * Where the snapshot this scan plans on is published for the deferred payload fetch that runs
+   * after the ranking. Driver-only; the fetch reads it after this scan planned its tasks.
+   */
+  private final LanceSearchVersionPin versionPin;
+
   private final String scanId = UUID.randomUUID().toString();
   private transient long driverPlanningTimeNs;
   private transient long driverIndexDiscoveryTimeNs;
@@ -81,10 +88,16 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
   private transient InputPartition[] plannedPartitions;
 
   public LanceDistributedSearchScan(StructType schema, LanceSearchQuery query) {
+    this(schema, query, new LanceSearchVersionPin());
+  }
+
+  public LanceDistributedSearchScan(
+      StructType schema, LanceSearchQuery query, LanceSearchVersionPin versionPin) {
     Objects.requireNonNull(
         query.getReadOptions(), "query.readOptions is required for distributed search");
     this.schema = schema;
     this.query = query;
+    this.versionPin = versionPin;
   }
 
   @Override
@@ -285,6 +298,12 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
           mixedPlan && resolvedQuery.getRefineFactor() == null
               ? resolvedQuery.toBuilder().refineFactor(1).build()
               : resolvedQuery;
+
+      // Publish the pinned snapshot before planning the units: the deferred payload fetch opens
+      // the dataset again and must land on this version, not on whatever is latest by then.
+      if (versionPin != null) {
+        versionPin.record(resolvedQuery.getReadOptions());
+      }
 
       List<LanceDistributedSearchInputPartition> units =
           planUnits(indexedQuery, resolvedQuery, liveSegments, fallbackFragments);

@@ -25,11 +25,18 @@ public class LanceDistributedSearchScanBuilder implements SupportsPushDownRequir
 
   private StructType schema;
   private LanceSearchQuery query;
+  private final LanceSearchVersionPin versionPin;
 
   public LanceDistributedSearchScanBuilder(StructType schema, LanceSearchQuery query) {
+    this(schema, query, new LanceSearchVersionPin());
+  }
+
+  public LanceDistributedSearchScanBuilder(
+      StructType schema, LanceSearchQuery query, LanceSearchVersionPin versionPin) {
     this.fullSchema = schema;
     this.schema = schema;
     this.query = query;
+    this.versionPin = versionPin;
   }
 
   @Override
@@ -44,6 +51,6 @@ public class LanceDistributedSearchScanBuilder implements SupportsPushDownRequir
 
   @Override
   public Scan build() {
-    return new LanceDistributedSearchScan(schema, query);
+    return new LanceDistributedSearchScan(schema, query, versionPin);
   }
 }

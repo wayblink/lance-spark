@@ -22,14 +22,20 @@ import java.util.ArrayList;
 import java.util.List;
 
 /** Keeps the internal columns required by a search plan while pruning payload columns. */
-final class LanceSearchProjection {
+public final class LanceSearchProjection {
   /**
    * Column lance-core appends to a batch search result, naming the query each row belongs to. The
    * batch plan builds it in {@code LanceSearchTableFunctions.QueryIndexColumn}; this Java side only
    * has to recognize it as connector-internal, so the value is repeated here rather than reaching
    * into the Scala object.
    */
-  static final String QUERY_INDEX = "query_index";
+  public static final String QUERY_INDEX = "query_index";
+
+  /**
+   * The generated distance column. A deferred search keeps it in the narrow scan and fetches the
+   * payload afterwards, so both sides have to agree on its name.
+   */
+  public static final String DISTANCE_COLUMN = "_distance";
 
   private LanceSearchProjection() {}
 

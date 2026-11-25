@@ -106,6 +106,16 @@ case class LanceDataSourceV2Strategy(session: SparkSession) extends SparkStrateg
     case SetUnenforcedPrimaryKey(ResolvedIdentifier(catalog, ident), columns) =>
       SetUnenforcedPrimaryKeyExec(asTableCatalog(catalog), ident, columns) :: Nil
 
+    case fetch: org.lance.spark.search.LanceFetchPayload =>
+      LanceFetchPayloadExec(
+        planLater(fetch.child),
+        fetch.columns,
+        fetch.fetched,
+        fetch.readOptions,
+        fetch.initialStorageOptions,
+        fetch.chunkRows,
+        fetch.pin) :: Nil
+
     case _ => Nil
   }
 

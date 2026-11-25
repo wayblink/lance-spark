@@ -33,16 +33,23 @@ public class LanceDistributedSearchTable implements SupportsRead {
   private final String name;
   private final StructType schema;
   private final LanceSearchQuery query;
+  private final LanceSearchVersionPin versionPin;
 
   public LanceDistributedSearchTable(String name, StructType schema, LanceSearchQuery query) {
+    this(name, schema, query, new LanceSearchVersionPin());
+  }
+
+  public LanceDistributedSearchTable(
+      String name, StructType schema, LanceSearchQuery query, LanceSearchVersionPin versionPin) {
     this.name = name;
     this.schema = schema;
     this.query = query;
+    this.versionPin = versionPin;
   }
 
   @Override
   public ScanBuilder newScanBuilder(CaseInsensitiveStringMap options) {
-    return new LanceDistributedSearchScanBuilder(schema, query);
+    return new LanceDistributedSearchScanBuilder(schema, query, versionPin);
   }
 
   @Override

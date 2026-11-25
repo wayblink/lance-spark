@@ -169,6 +169,18 @@ silently changing what the filter means.
 apply them yet. Disable `spark.sql.lance.search.distributed.enabled` to run any of these through
 the namespace.
 
+### Deferred payload fetch
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `spark.sql.lance.search.payload.deferral.mode` | `off` | `off` reads the payload inside each search task (fused). `auto` defers it to a row-id fetch when one unit's estimated payload volume reaches the threshold. `force` always defers. See [VECTOR_SEARCH execution](operations/dql/vector-search.md#deferring-the-payload-read). |
+| `spark.sql.lance.search.payload.deferral.min.bytes` | `33554432` | `auto` threshold on `num_results x queries x estimated row width`, the payload volume a single search task reads. |
+| `spark.sql.lance.search.payload.deferral.chunk.rows` | `1024` | Rows per deferred payload fetch task. An internal 16 MiB estimate-based budget can lower it for wide rows. |
+
+The deferred shape keeps the ranking contract identical: the same per-unit top-k candidates, the
+same `(distance, rowid)` tie-break, and the same `_distance` values. It only changes where the
+payload columns are read, and it verifies each fetched row id rather than trusting response order.
+
 ## Cache Backends
 
 Each Spark catalog owns an isolated Lance `Session`. Select registered native cache backends for

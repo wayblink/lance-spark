@@ -16,11 +16,11 @@ package org.lance.spark.search
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedStar}
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, CreateArray, CurrentRow, Descending, Expression, LessThanOrEqual, Literal, NamedExpression, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, Cast, CreateArray, CurrentRow, Descending, Expression, LessThanOrEqual, Literal, NamedExpression, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, GlobalLimit, Limit, LocalLimit, LogicalPlan, Offset, Project, Sort, Window}
 import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
-import org.apache.spark.sql.types.{DataTypes, StructField, StructType}
+import org.apache.spark.sql.types.{ArrayType, DataTypes, MapType, StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.lance.ipc.FullTextQuery
 import org.lance.spark.{LanceDataset, LanceSparkReadOptions}
@@ -33,6 +33,8 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 
 object LanceSearchTableFunctions {
+  private val logger = org.slf4j.LoggerFactory.getLogger(getClass)
+
   private val DefaultK: Integer = Integer.valueOf(10)
   private val TableArg = "table"
   private val QueryVectorArg = "query_vector"
@@ -401,67 +403,190 @@ object LanceSearchTableFunctions {
         scanSchema
       }
 
-    val rel = DataSourceV2Relation.create(
-      new LanceDistributedSearchTable(functionName, batchSchema, scanQuery),
-      Some(resolved.catalog),
-      Some(resolved.identifier),
-      CaseInsensitiveStringMap.empty())
+    // Everything the ranking does not read is payload: it is either read inside the native search
+    // (fused) or fetched by row id after the global ranking (deferred).
+    val payloadFields =
+      batchSchema.fields.filterNot(field => isRankingColumn(field.name, scanQuery.isBatch)).toSeq
+    val candidates =
+      scanQuery.getK.longValue() * math.max(scanQuery.getQueryCount().toLong, 1L)
+    // A nested payload column cannot be deferred safely: takeRows returns the stored struct, while
+    // the scan schema may carry widened child fields, so the two Arrow layouts could disagree.
+    val deferrablePayload = payloadFields.forall(isDeferrablePayload)
+    val deferral =
+      if (deferrablePayload) {
+        LancePayloadDeferral.plan(
+          SparkSession.active,
+          batchSchema,
+          payloadFields.map(_.name),
+          candidates)
+      } else {
+        None
+      }
 
-    def internalColumn(name: String) =
-      rel.output
-        .find(attr => attr.name == name)
-        .getOrElse {
-          throw new IllegalStateException(
-            s"Internal column ${name} is missing from vector_search plan.")
-        }
+    // The scan pins the snapshot while it plans; the fetch node reads that pin afterwards so the
+    // payload comes from the version the search actually saw.
+    val versionPin = new LanceSearchVersionPin()
 
-    if (scanQuery.isBatch) {
-      // A batch cannot reuse the sort-and-limit below: that keeps the global k, and the rows a
-      // query needs can be any distance, so ranking has to happen inside each query first.
-      return batchRelation(rel, internalColumn, scanQuery.getK, schema, wantsRowId)
+    def relation(tableSchema: StructType): LogicalPlan =
+      DataSourceV2Relation.create(
+        new LanceDistributedSearchTable(functionName, tableSchema, scanQuery, versionPin),
+        Some(resolved.catalog),
+        Some(resolved.identifier),
+        CaseInsensitiveStringMap.empty())
+
+    if (logger.isInfoEnabled) {
+      val columns = payloadFields.map(_.name).mkString("[", ", ", "]")
+      deferral match {
+        case Some(settings) =>
+          logger.info(
+            s"VECTOR_SEARCH deferred payload: columns=$columns, candidatesPerUnit=$candidates, " +
+              s"estimatedRowWidth=${settings.estimatedRowWidth}, " +
+              s"estimatedBytesPerUnit=${settings.estimatedPayloadBytes}, " +
+              s"chunkRows=${settings.chunkRows}")
+        case None =>
+          logger.info(
+            s"VECTOR_SEARCH fused payload: columns=$columns, candidatesPerUnit=$candidates")
+      }
     }
 
-    val sortOrder =
-      Seq(
-        SortOrder(internalColumn(DistanceMetricColumn), Ascending),
-        SortOrder(internalColumn(RowIdColumn), Ascending))
-    val sorted = Sort(sortOrder, global = true, rel)
+    val ranked = deferral match {
+      case None =>
+        rankSearch(relation(batchSchema), scanQuery)
+      case Some(settings) =>
+        val narrowSchema =
+          StructType(
+            batchSchema.fields.filterNot(field => payloadFields.exists(_.name == field.name)))
+        val winners = rankSearch(relation(narrowSchema), scanQuery)
+        fetchPayload(
+          winners,
+          batchSchema,
+          payloadFields.map(_.name),
+          settings,
+          scanQuery,
+          resolved,
+          versionPin)
+    }
+
+    finishSearch(ranked, scanQuery.isBatch, schema, wantsRowId)
+  }
+
+  /** Whether a column is one the ranking itself needs, and so stays in the narrow scan. */
+  private def isRankingColumn(name: String, batch: Boolean): Boolean =
+    name.equalsIgnoreCase(DistanceMetricColumn) ||
+      name.equalsIgnoreCase(RowIdColumn) ||
+      (batch && name.equalsIgnoreCase(QueryIndexColumn))
+
+  /** Whether a payload column can be fetched by row id without changing its Arrow layout. */
+  private def isDeferrablePayload(field: StructField): Boolean = field.dataType match {
+    case _: StructType | _: MapType => false
+    case ArrayType(element, _) =>
+      !element.isInstanceOf[StructType] && !element.isInstanceOf[MapType]
+    case _ => true
+  }
+
+  private def columnOf(plan: LogicalPlan, name: String): Attribute =
+    plan.output
+      .find(attr => attr.name == name)
+      .getOrElse {
+        throw new IllegalStateException(
+          s"Internal column ${name} is missing from vector_search plan.")
+      }
+
+  /** The global ranking of a search: sort and limit one query, rank inside each query for a batch. */
+  private def rankSearch(rel: LogicalPlan, query: LanceSearchQuery): LogicalPlan = {
+    if (query.isBatch) {
+      // A batch cannot reuse the sort-and-limit below: that keeps the global k, and the rows a
+      // query needs can be any distance, so ranking has to happen inside each query first.
+      return batchRanking(rel, query.getK)
+    }
+
+    val sorted =
+      Sort(
+        Seq(
+          SortOrder(columnOf(rel, DistanceMetricColumn), Ascending),
+          SortOrder(columnOf(rel, RowIdColumn), Ascending)),
+        global = true,
+        rel)
     val totalCandidates = query.getK
     val effectiveOffset =
       if (query.getOffset != null) query.getOffset.intValue() else 0
     val userK = math.max(totalCandidates - effectiveOffset, 0)
     val candidateLimited =
       GlobalLimit(Literal(totalCandidates), LocalLimit(Literal(totalCandidates), sorted))
-    val limited =
-      if (effectiveOffset > 0) {
-        GlobalLimit(
-          Literal(userK),
-          LocalLimit(Literal(userK), Offset(Literal(effectiveOffset), candidateLimited)))
-      } else {
-        candidateLimited
-      }
+    if (effectiveOffset > 0) {
+      GlobalLimit(
+        Literal(userK),
+        LocalLimit(Literal(userK), Offset(Literal(effectiveOffset), candidateLimited)))
+    } else {
+      candidateLimited
+    }
+  }
 
-    if (wantsRowId) limited
-    else Project(rel.output.filterNot(attr => attr.name == RowIdColumn), limited)
+  /** Adds the payload columns of the declared schema to the narrow result by row id. */
+  private def fetchPayload(
+      winners: LogicalPlan,
+      outputSchema: StructType,
+      payloadNames: Seq[String],
+      settings: LancePayloadDeferral.Settings,
+      query: LanceSearchQuery,
+      resolved: ResolvedLanceTable,
+      versionPin: LanceSearchVersionPin): LogicalPlan = {
+    // The payload columns have to be attributes of the child, not invented ones: Spark rejects a
+    // plan whose output names attributes its input does not provide. They are null placeholders
+    // here and this node replaces their values with the fetched payload; the scan below never reads
+    // them, because the placeholder references no input column.
+    val childProjection: Seq[NamedExpression] = outputSchema.fields.map { field =>
+      if (payloadNames.contains(field.name)) {
+        Alias(Cast(Literal(null), field.dataType), field.name)(): NamedExpression
+      } else {
+        columnOf(winners, field.name)
+      }
+    }.toSeq
+    val child = Project(childProjection, winners)
+    val columns = child.output
+    val fetched = columns.filter(column => payloadNames.contains(column.name))
+    LanceFetchPayload(
+      child,
+      columns,
+      fetched,
+      query.getReadOptions,
+      resolved.table.getInitialStorageOptions,
+      settings.chunkRows,
+      versionPin)
+  }
+
+  /** The caller-visible projection: `query_id` for a batch, `_rowid` only when it was asked for. */
+  private def finishSearch(
+      plan: LogicalPlan,
+      isBatch: Boolean,
+      schema: StructType,
+      wantsRowId: Boolean): LogicalPlan = {
+    if (isBatch) {
+      val projected = schema.fields.map { field =>
+        val source =
+          if (field.name == QueryIdColumn) columnOf(plan, QueryIndexColumn)
+          else columnOf(plan, field.name)
+        Alias(source, field.name)(): NamedExpression
+      }.toSeq
+      Project(projected, plan)
+    } else if (wantsRowId) {
+      plan
+    } else {
+      Project(plan.output.filterNot(attr => attr.name == RowIdColumn), plan)
+    }
   }
 
   /**
    * The global top-k of every query: each task returns its own top k per query, and the merge has
-   * to keep k per query rather than k overall, so the rows are ranked inside their query. Row id
-   * breaks ties the way lance-core does (by `_distance`, then row id), and the query index comes
-   * out as the leading `query_id` column.
+   * to keep k per query rather than k overall, so the rows are ranked inside their query first.
+   * Row id breaks ties the way lance-core does (by `_distance`, then row id).
    */
-  private def batchRelation(
-      rel: LogicalPlan,
-      internalColumn: String => org.apache.spark.sql.catalyst.expressions.Attribute,
-      k: Integer,
-      schema: StructType,
-      wantsRowId: Boolean): LogicalPlan = {
-    val partitionSpec = Seq(internalColumn(QueryIndexColumn))
+  private def batchRanking(rel: LogicalPlan, k: Integer): LogicalPlan = {
+    val partitionSpec = Seq(columnOf(rel, QueryIndexColumn))
     val orderSpec =
       Seq(
-        SortOrder(internalColumn(DistanceMetricColumn), Ascending),
-        SortOrder(internalColumn(RowIdColumn), Ascending))
+        SortOrder(columnOf(rel, DistanceMetricColumn), Ascending),
+        SortOrder(columnOf(rel, RowIdColumn), Ascending))
     // A bare RowNumber inside Window is rejected by the analyzer; the window function has to carry
     // its OVER clause the way the parser builds it.
     val ranking =
@@ -479,22 +604,8 @@ object LanceSearchTableFunctions {
         orderSpec,
         rel)
 
-    def rankedColumn(name: String) =
-      ranking.output
-        .find(attr => attr.name == name)
-        .getOrElse {
-          throw new IllegalStateException(s"Column ${name} is missing from the ranking plan.")
-        }
-
-    val withinK = Filter(LessThanOrEqual(rankedColumn(BatchRankColumn), Literal(k)), ranking)
-
-    val projected = schema.fields.map { field =>
-      val source =
-        if (field.name == QueryIdColumn) internalColumn(QueryIndexColumn)
-        else internalColumn(field.name)
-      Alias(source, field.name)(): NamedExpression
-    }.toSeq
-    Project(projected, withinK)
+    val rankColumn = columnOf(ranking, BatchRankColumn)
+    Filter(LessThanOrEqual(rankColumn, Literal(k)), ranking)
   }
 
   /**

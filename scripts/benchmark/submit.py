@@ -94,6 +94,30 @@ def store(output, name, data, secrets):
     (output/name).write_text(pilot.redact(data, secrets))
 
 
+def validate_expected_cell(records, kind, k, eventlog):
+    baseline.require(records and all(x.get("kind")==kind and x.get("k")==k for x in records), "samples belong to a different cell")
+    expected=40 if kind=="single" else 4
+    baseline.require(len(records)==expected,"wrong cell sample/warmup count")
+    return baseline.validate_run(records,eventlog)
+
+
+def capture(name, operation, errors):
+    try:
+        result=operation()
+        if hasattr(result,"returncode") and result.returncode!=0:
+            errors[name]="exit_"+str(result.returncode)
+        return result
+    except Exception as exc:
+        errors[name]=type(exc).__name__
+        return None
+
+
+def write_verdict(output, verdict, errors, secrets):
+    verdict["evidence_errors"]=errors
+    if errors:verdict["baseline_valid"]=False
+    store(output,"verdict.json",verdict,secrets)
+
+
 def platform_config():
     p=Path(os.environ.get("SPARK_DEFAULTS", "/opt/apache-kyuubi-1.11.0-bin/conf/spark-defaults.conf"))
     values={}
@@ -187,27 +211,31 @@ def run_cell(c, kind, k, jar, remote_contract, remote_truth, root, remote_root, 
         if monitor:monitor.join(timeout=30)
         observations.append(snapshot(ns,app,name))
         store(output,"activity-final.json",observations[-1],secrets)
-        logs=pilot.kube(["logs","-n",ns,name],timeout=45);store(output,"driver.log",logs.stdout+logs.stderr,secrets)
-        d=pilot.kube(["describe","pod","-n",ns,name]);store(output,"describe.txt",d.stdout+d.stderr,secrets)
-        pilot.record_pods_and_events(output,ns,name,uid,secrets)
-        pilot.call([hdfs,"dfs","-get",remote+"/spark-events",str(output/"spark-events")],timeout=120)
-        fetched=pilot.call([hdfs,"dfs","-cat",remote+"/samples.jsonl"],timeout=60)
-        if fetched.returncode==0:
+        errors={}
+        logs=capture("logs",lambda:pilot.kube(["logs","-n",ns,name],timeout=45),errors)
+        if logs is not None: store(output,"driver.log",logs.stdout+logs.stderr,secrets)
+        d=capture("describe",lambda:pilot.kube(["describe","pod","-n",ns,name]),errors)
+        if d is not None: store(output,"describe.txt",d.stdout+d.stderr,secrets)
+        capture("pods_events",lambda:pilot.record_pods_and_events(output,ns,name,uid,secrets),errors)
+        capture("eventlog_fetch",lambda:pilot.call([hdfs,"dfs","-get",remote+"/spark-events",str(output/"spark-events")],timeout=120),errors)
+        fetched=capture("samples_fetch",lambda:pilot.call([hdfs,"dfs","-cat",remote+"/samples.jsonl"],timeout=60),errors)
+        if fetched is not None and fetched.returncode==0:
             store(output,"samples.jsonl",fetched.stdout,secrets)
             records=[json.loads(line) for line in fetched.stdout.splitlines() if line.strip()]
+        else: records=[]
         eventlog=any(p.is_file() for p in (output/"spark-events").rglob("*")) if (output/"spark-events").exists() else False
         clean=window_valid(records,observations) and not api_unknown
         verdict={"kind":kind,"k":k,"pod":name,"uid":uid,"app":app,"state":state,"exclusive_window_valid":clean,
                  "eventlog_present":eventlog,"elapsed_seconds":time.monotonic()-start,
                  "baseline_valid":False,"cache_residency":"unknown","cleanup":"own terminal pod retained as evidence"}
         try:
-            baseline.validate_run(records,eventlog)
+            validate_expected_cell(records,kind,k,eventlog)
             expected_marker='BASELINE_DONE {"ok":true,"kind":"'+kind+'","k":'+str(k)+'}'
-            verdict["done_marker_present"] = expected_marker in logs.stdout
+            verdict["done_marker_present"] = logs is not None and expected_marker in logs.stdout
             verdict["baseline_valid"]=state=="SUCCEEDED" and clean and verdict["done_marker_present"]
         except (ValueError,KeyError) as exc:verdict["validation_error"]=str(exc)
         if not clean:verdict["window_action"]="whole cell invalid; explicit new-attempt rerun required, never silently accepted"
-        store(output,"verdict.json",verdict,secrets)
+        write_verdict(output,verdict,errors,secrets)
     baseline.require(verdict["baseline_valid"],f"cell {kind} k{k} invalid; matrix stopped, preserve failure")
     return records
 

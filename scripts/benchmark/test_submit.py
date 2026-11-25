@@ -38,6 +38,15 @@ class SubmitTests(unittest.TestCase):
         self.assertFalse(submit.window_valid([sample], [{"at_ms": 1100, "api_ok": True, "foreign": [{"uid": "external"}]}]))
         self.assertFalse(submit.window_valid([sample], []))
 
+    def test_window_relevance_filter_matches_gap_tolerance(self):
+        """Preceding observation 20.1s before a sample start is inside the 35s tolerance."""
+        observations=[{"at_ms":base,"api_ok":True,"foreign":[]} for base in
+                      (80000,102900,125800)]
+        sample={"warmup":False,"started_ms":100100,"ms":5190}
+        self.assertTrue(submit.window_valid([sample],observations))
+        # Removing the middle poll leaves a 45.8s hole: the same sample must fail.
+        self.assertFalse(submit.window_valid([sample],[observations[0],observations[2]]))
+
     def test_wrong_cell_samples_cannot_pass_expected_cell(self):
         rows=[]
         for q in range(10):

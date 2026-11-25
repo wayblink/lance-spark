@@ -13,6 +13,8 @@ import baseline
 import pilot
 
 POLL_SECONDS = 20
+# Maximum tolerated distance from any measured instant to the nearest window observation.
+COVERAGE_SECONDS = POLL_SECONDS + 15
 
 # Driver UIDs whose own evidence proves SparkContext stopped and no executor remains.
 # This is an explicit, UID-fenced allowlist; a replacement pod or any executor revokes it.
@@ -124,17 +126,21 @@ def window_valid(samples, observations):
     samples = [x for x in samples if not x.get("warmup")]
     if not samples or not observations:
         return False
+    # One tolerance governs both "which observations are relevant" and "how large a hole is
+    # acceptable"; using a tighter filter than the tolerance rejects clean windows whenever a
+    # short sample fits between two polls.
+    tolerance = COVERAGE_SECONDS * 1000
     for sample in samples:
         start, end = sample["started_ms"], sample["started_ms"] + sample["ms"]
-        relevant = [o for o in observations if start-POLL_SECONDS*1000 <= o["at_ms"] <= end+POLL_SECONDS*1000]
+        relevant = [o for o in observations if start-tolerance <= o["at_ms"] <= end+tolerance]
         if not relevant or any(not o["api_ok"] or o["foreign"] for o in relevant):
             return False
-        if not any(o["at_ms"] <= start and start-o["at_ms"] <= (POLL_SECONDS+15)*1000 for o in relevant):
+        if not any(o["at_ms"] <= start for o in relevant):
             return False
-        if not any(o["at_ms"] >= end and o["at_ms"]-end <= (POLL_SECONDS+15)*1000 for o in relevant):
+        if not any(o["at_ms"] >= end for o in relevant):
             return False
         times = sorted(o["at_ms"] for o in relevant)
-        if max([times[0]-start, end-times[-1]]+[b-a for a,b in zip(times,times[1:])]) > (POLL_SECONDS+15)*1000:
+        if max([times[0]-start, end-times[-1]]+[b-a for a,b in zip(times,times[1:])]) > tolerance:
             return False
     return True
 

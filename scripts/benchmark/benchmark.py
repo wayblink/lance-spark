@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare one immutable five-cell matrix. Submission intentionally requires later reviewed lifecycle."""
+"""Prepare a fixed matrix by default; explicit --run --approved submits five sequential cells."""
 import argparse
 import json
 from pathlib import Path
@@ -26,7 +26,16 @@ def main():
     p.add_argument("--contract",type=Path,default=Path(__file__).with_name("baseline-10m.json"))
     p.add_argument("--queries",required=True);p.add_argument("--truth",required=True)
     p.add_argument("--output-root",required=True)
+    p.add_argument("--run", action="store_true", help="explicit approved cluster mode; dry-run is default")
+    p.add_argument("--approved", action="store_true")
+    p.add_argument("--window-seconds", type=int, default=1800)
     a=p.parse_args();c=json.loads(a.contract.read_text())
+    if a.run:
+        if not a.approved:
+            p.error("--run requires --approved after root code review and user authorization")
+        import submit
+        submit.run_matrix(c, a.contract, Path(a.queries), Path(a.truth), Path(a.output_root), a.window_seconds)
+        return
     print(json.dumps({"status":"MATRIX_PREPARED_NOT_SUBMITTED", "source":"BaselineBenchmark.java",
                       "contract_sha256":baseline.sha256(a.contract),"spark_conf":baseline.spark_conf(c),
                       "cells":matrix(c,a.contract,a.queries,a.truth,a.output_root),

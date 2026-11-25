@@ -15,16 +15,16 @@ def names(suite):
         if isinstance(test, unittest.TestSuite):
             yield from names(test)
         else:
-            yield test.id().split("test_baseline.", 1)[-1]
+            yield test.id()
 
 
 def run(name):
-    p = subprocess.run([sys.executable, "-m", "unittest", "test_baseline." + name],
+    p = subprocess.run([sys.executable, "-m", "unittest", name],
                        cwd=Path(__file__).resolve().parent, capture_output=True, text=True)
     return name, p.returncode, p.stdout + p.stderr
 
 
-suite = unittest.defaultTestLoader.loadTestsFromModule(test_baseline)
+suite = unittest.defaultTestLoader.discover(str(Path(__file__).resolve().parent), pattern="test_*.py")
 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
     results = list(pool.map(run, names(suite)))
 for name, rc, output in results:

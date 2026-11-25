@@ -14,6 +14,7 @@
 package org.lance.spark.search
 
 import org.lance.spark.LanceSparkReadOptions
+import org.lance.spark.internal.DatasetLeaseSettings
 
 /**
  * Everything a deferred payload fetch needs to open the dataset again: the read options (pinned by
@@ -29,7 +30,8 @@ class LanceFetchPayloadSource(
     val readOptions: LanceSparkReadOptions,
     val initialStorageOptions: java.util.Map[String, String],
     val namespaceImpl: String,
-    val namespaceProperties: java.util.Map[String, String])
+    val namespaceProperties: java.util.Map[String, String],
+    val leaseSettings: DatasetLeaseSettings)
   extends Serializable {
 
   /** Deliberately opaque: storage options are credentials and must not enter a plan string. */

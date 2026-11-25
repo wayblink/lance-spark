@@ -20,9 +20,8 @@ import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
 import org.lance.ipc.ScanStats;
 import org.lance.spark.LanceConstant;
-import org.lance.spark.internal.ExecutorNamespace;
+import org.lance.spark.internal.DatasetLease;
 import org.lance.spark.read.metric.LanceReadMetricsTracker;
-import org.lance.spark.utils.Utils;
 
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
@@ -85,7 +84,7 @@ public class LanceDistributedSearchColumnarPartitionReader
   private final LanceBatchChunkMetrics batchMetrics = new LanceBatchChunkMetrics();
   private final CustomTaskMetric[] taskMetrics;
 
-  private ExecutorNamespace executorNamespace;
+  private DatasetLease.Handle datasetLease;
   private Dataset dataset;
   private LanceScanner scanner;
   private ArrowReader reader;
@@ -164,8 +163,9 @@ public class LanceDistributedSearchColumnarPartitionReader
       }
     }
     first = closeChunkScan(first);
-    first = closeQuietly(dataset, first);
-    first = closeQuietly(executorNamespace, first);
+    first = closeQuietly(datasetLease, first);
+    datasetLease = null;
+    dataset = null;
     if (first != null) {
       throw new IOException("Failed to close LanceDistributedSearchColumnarPartitionReader", first);
     }
@@ -283,25 +283,39 @@ public class LanceDistributedSearchColumnarPartitionReader
     return true;
   }
 
+  /**
+   * Borrows the dataset through the process-local lease, so a task after this one on the same
+   * executor can reuse a dataset it already opened on the same pinned version and credentials. A
+   * reused lease costs no open and no snapshot read; a miss opens exactly what this task would have
+   * opened anyway.
+   *
+   * <p>The namespace client lives inside the lease, so a reused dataset keeps the client it was
+   * opened with, and the lease's maximum age bounds how long that client may serve.
+   */
   private void openDataset() throws IOException {
     LanceSearchQuery query = partition.getQuery();
-    executorNamespace =
-        ExecutorNamespace.acquire(
-            query.getReadOptions(), query.getNamespaceImpl(), query.getNamespaceProperties());
     long openStart = System.nanoTime();
-    dataset =
-        Utils.openDatasetBuilder(query.getReadOptions())
-            .initialStorageOptions(query.getInitialStorageOptions())
-            .build();
+    datasetLease =
+        DatasetLease.acquire(
+            query.getReadOptions(),
+            query.getInitialStorageOptions(),
+            query.getNamespaceImpl(),
+            query.getNamespaceProperties(),
+            partition.getLeaseSettings());
+    dataset = datasetLease.dataset();
     metricsTracker.addDatasetOpenTimeNs(System.nanoTime() - openStart);
+    metricsTracker.addDatasetLease(datasetLease.opened(), datasetLease.reused());
     // One line per task, so an executor-side log can be matched to the driver's planning line for
     // the same scan (both carry scanId) instead of guessing by timing or by fragment numbers.
     LOG.info(
-        "Lance distributed search task: scanId={}, unit={}, chunks={}, datasetOpenTimeNs={}",
+        "Lance distributed search task: scanId={}, unit={}, chunks={}, datasetOpenTimeNs={}, "
+            + "datasetOpened={}, datasetReused={}",
         partition.getScanId(),
         describe(partition),
         chunkPlan.chunks(),
-        metricsTracker.getDatasetOpenTimeNs());
+        metricsTracker.getDatasetOpenTimeNs(),
+        datasetLease.opened(),
+        datasetLease.reused());
   }
 
   /**

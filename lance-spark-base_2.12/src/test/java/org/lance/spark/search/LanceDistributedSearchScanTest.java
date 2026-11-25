@@ -17,6 +17,7 @@ import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
 import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.TestUtils;
+import org.lance.spark.internal.DatasetLeaseSettings;
 import org.lance.spark.read.metric.LanceCustomMetrics;
 import org.lance.spark.search.LanceSearchQuery.SearchType;
 
@@ -149,7 +150,12 @@ class LanceDistributedSearchScanTest {
             .build();
     LanceDistributedSearchInputPartition partition =
         LanceDistributedSearchInputPartition.forFragment(
-            new StructType(), query, 1, LanceBatchChunkPlan.singleQuery(), "test-scan");
+            new StructType(),
+            query,
+            1,
+            LanceBatchChunkPlan.singleQuery(),
+            "test-scan",
+            DatasetLeaseSettings.defaults());
 
     // An explicit nprobes means exactly that many probes, matching how lance maps the field on a
     // namespace query since lance#9184.
@@ -175,7 +181,12 @@ class LanceDistributedSearchScanTest {
     ScanOptions fallback =
         LanceDistributedSearchColumnarPartitionReader.buildScanOptions(
             LanceDistributedSearchInputPartition.forFragment(
-                new StructType(), query, 1, LanceBatchChunkPlan.singleQuery(), "test-scan"));
+                new StructType(),
+                query,
+                1,
+                LanceBatchChunkPlan.singleQuery(),
+                "test-scan",
+                DatasetLeaseSettings.defaults()));
     assertFalse(fallback.getNearest().get().isUseIndex(), "flat unit must not use the index");
 
     ScanOptions indexed =
@@ -185,7 +196,8 @@ class LanceDistributedSearchScanTest {
                 query,
                 UUID.randomUUID(),
                 LanceBatchChunkPlan.singleQuery(),
-                "test-scan"));
+                "test-scan",
+                DatasetLeaseSettings.defaults()));
     assertTrue(indexed.getNearest().get().isUseIndex(), "indexed unit must use the index");
   }
 

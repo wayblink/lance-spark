@@ -55,6 +55,9 @@ public final class LanceCustomMetrics {
   public static final String NUM_BATCH_CHUNK_QUERIES = "numBatchChunkQueries";
   public static final String NUM_BATCH_CHUNK_BYTES = "numBatchChunkBytes";
 
+  public static final String NUM_DATASET_OPENS = "numDatasetOpens";
+  public static final String NUM_DATASET_LEASE_HITS = "numDatasetLeaseHits";
+
   public static final String DATASET_OPEN_TIME_NS = "datasetOpenTimeNs";
   public static final String SCANNER_CREATE_TIME_NS = "scannerCreateTimeNs";
   public static final String BATCH_LOAD_TIME_NS = "batchLoadTimeNs";
@@ -281,6 +284,30 @@ public final class LanceCustomMetrics {
     }
   }
 
+  public static class NumDatasetOpensMetric extends CustomSumMetric {
+    @Override
+    public String name() {
+      return NUM_DATASET_OPENS;
+    }
+
+    @Override
+    public String description() {
+      return "number of Lance datasets this search task had to open";
+    }
+  }
+
+  public static class NumDatasetLeaseHitsMetric extends CustomSumMetric {
+    @Override
+    public String name() {
+      return NUM_DATASET_LEASE_HITS;
+    }
+
+    @Override
+    public String description() {
+      return "number of Lance datasets this search task reused instead of opening";
+    }
+  }
+
   public static class DriverIndexDiscoveryTimeNsMetric extends CustomNsTimeMetric {
     @Override
     public String name() {
@@ -314,6 +341,11 @@ public final class LanceCustomMetrics {
     new NumBatchChunksMetric(), new NumBatchChunkQueriesMetric(), new NumBatchChunkBytesMetric(),
   };
 
+  /** Lease counters: a task reader reports them, the plain read path has no lease. */
+  private static final CustomMetric[] LEASE_METRICS = {
+    new NumDatasetOpensMetric(), new NumDatasetLeaseHitsMetric(),
+  };
+
   /**
    * Search-only metrics: the driver timings are never emitted by a task reader, the batch-chunk
    * counters are never emitted by the read path, and the read path must not declare counters it
@@ -321,13 +353,18 @@ public final class LanceCustomMetrics {
    */
   public static CustomMetric[] distributedSearchMetrics() {
     CustomMetric[] metrics =
-        Arrays.copyOf(ALL_METRICS, ALL_METRICS.length + 2 + BATCH_SEARCH_METRICS.length);
+        Arrays.copyOf(
+            ALL_METRICS,
+            ALL_METRICS.length + 2 + BATCH_SEARCH_METRICS.length + LEASE_METRICS.length);
     // Appended after the copied array: overwriting from index 0 would leave the tail null, and
     // DataSourceV2ScanExecBase fails the query on a null metric.
     int next = ALL_METRICS.length;
     metrics[next++] = new DriverPlanningTimeNsMetric();
     metrics[next++] = new DriverIndexDiscoveryTimeNsMetric();
     for (CustomMetric metric : BATCH_SEARCH_METRICS) {
+      metrics[next++] = metric;
+    }
+    for (CustomMetric metric : LEASE_METRICS) {
       metrics[next++] = metric;
     }
     return metrics;

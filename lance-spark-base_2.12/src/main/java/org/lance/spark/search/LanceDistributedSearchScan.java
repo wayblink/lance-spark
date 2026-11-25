@@ -18,12 +18,17 @@ import org.lance.Fragment;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
+import org.lance.spark.LanceRef;
+import org.lance.spark.LanceSparkReadOptions;
+import org.lance.spark.internal.DatasetLease;
+import org.lance.spark.internal.DatasetLeaseSettings;
 import org.lance.spark.read.metric.LanceCustomMetrics;
 import org.lance.spark.utils.FieldPathUtils;
 import org.lance.spark.utils.Utils;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.read.Batch;
@@ -220,101 +225,55 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
     }
   }
 
+  /**
+   * Plans the search units, reusing the version-scoped discovery an earlier query on this driver
+   * already did when there is one.
+   *
+   * <p>Fragments, the selected vector index and its segments are fixed by the dataset version, so
+   * they can answer a later query on that same version. On a hit the open remains - it is how a
+   * "latest" request learns which version to plan - but the fragment listing and index discovery,
+   * the two reads that make planning expensive on a large table, are skipped.
+   */
   private InputPartition[] planPartitions() {
     Dataset dataset =
         Utils.openDatasetBuilder(query.getReadOptions())
             .initialStorageOptions(query.getInitialStorageOptions())
             .build();
     try {
-      Set<Integer> existingFragments = new HashSet<>();
-      for (Fragment fragment : dataset.getFragments()) {
-        existingFragments.add(fragment.getId());
+      LanceRef pinnedRef = Utils.pinOpenedRef(dataset, query.getReadOptions().getRef());
+      LanceSparkReadOptions pinnedOptions = query.getReadOptions().withRef(pinnedRef);
+      SearchPlanCache<PlanSnapshot> cache = metadataCache();
+      SearchPlanCache.Key cacheKey = cacheKey(pinnedRef);
+      PlanSnapshot snapshot = cache == null ? null : cache.get(cacheKey);
+      boolean metadataHit = snapshot != null;
+      if (snapshot == null) {
+        snapshot = discover(dataset);
+        // A discovery that fell back to flat KNN because the index listing failed is not a fact
+        // about this version: caching it would keep searching flat until eviction.
+        if (cache != null && !snapshot.discoveryFailed) {
+          cache.put(cacheKey, snapshot);
+        }
       }
-      if (existingFragments.isEmpty()) {
+      if (snapshot.fragments.isEmpty()) {
         LOG.info("Lance distributed vector search: empty dataset, returning empty result");
         return new InputPartition[0];
       }
 
-      boolean fastSearch = Boolean.TRUE.equals(query.getFastSearch());
-      boolean bypassVectorIndex = Boolean.TRUE.equals(query.getBypassVectorIndex());
-      String requestedIndex = query.getIndexName();
-      if (requestedIndex != null && requestedIndex.isEmpty()) {
-        // An empty name is a mistake, not "no name": treating it as absent would run some other
-        // index while the caller believes they picked one.
-        throw new IllegalArgumentException(
-            "index must name a vector index; an empty name cannot select one");
-      }
-      long discoveryStart = System.nanoTime();
-      NamedVectorIndex namedIndex;
-      String column;
-      Optional<VectorIndexInfo> vectorIndex;
-      try {
-        namedIndex =
-            requestedIndex != null
-                ? resolveNamedVectorIndex(dataset, requestedIndex, query.getVectorColumn())
-                : null;
-        // A named index decides the column, even when the search bypasses the index: the caller
-        // named an index, so the column it was built on is the one they mean.
-        column = namedIndex != null ? namedIndex.column : resolveVectorColumn();
-        if (namedIndex != null && bypassVectorIndex) {
-          // bypass_vector_index means "do not search an index"; naming one is not a conflict worth
-          // failing on, but it must not look as if the named index was used.
-          LOG.warn("Ignoring index {} because bypass_vector_index=true", requestedIndex);
-        }
-        vectorIndex =
-            bypassVectorIndex
-                ? Optional.empty()
-                : selectVectorIndex(
-                    dataset,
-                    column,
-                    query.getDistanceType(),
-                    fastSearch,
-                    namedIndex == null ? null : namedIndex.description,
-                    namedIndex == null ? null : namedIndex.allIndices);
-      } finally {
-        driverIndexDiscoveryTimeNs = System.nanoTime() - discoveryStart;
-      }
-
-      // A segment whose fragments are all gone (compaction, deletion) is stale: no unit for it.
-      Set<Integer> fallbackFragments = new TreeSet<>(existingFragments);
-      List<UUID> liveSegments = new ArrayList<>();
-      if (vectorIndex.isPresent()) {
-        for (VectorIndexSegment segment : vectorIndex.get().getSegments()) {
-          fallbackFragments.removeAll(segment.getFragmentIds());
-          if (!Collections.disjoint(segment.getFragmentIds(), existingFragments)) {
-            liveSegments.add(segment.getUuid());
-          }
-        }
-      }
-      if (fastSearch) {
-        fallbackFragments.clear();
-      }
-
+      boolean mixedPlan = !snapshot.liveSegments.isEmpty() && !snapshot.fallbackFragments.isEmpty();
       LanceSearchQuery resolvedQuery =
-          query.toBuilder()
-              .vectorColumn(column)
-              .readOptions(
-                  query
-                      .getReadOptions()
-                      .withRef(Utils.pinOpenedRef(dataset, query.getReadOptions().getRef())))
-              .build();
-      boolean mixedPlan = !liveSegments.isEmpty() && !fallbackFragments.isEmpty();
+          query.toBuilder().vectorColumn(snapshot.column).readOptions(pinnedOptions).build();
       // Indexed tasks search with the index's metric when none is given, while flat tasks would
       // default to L2; the global merge needs both on the same metric.
       if ((resolvedQuery.getDistanceType() == null || resolvedQuery.getDistanceType().isEmpty())
           && mixedPlan) {
-        String indexMetric =
-            vectorIndex
-                .get()
-                .getMetric()
-                .orElseThrow(
-                    () ->
-                        new IllegalArgumentException(
-                            "Cannot determine the distance metric for vector index '"
-                                + vectorIndex.get().getIndexName()
-                                + "'; pass distance_type explicitly before mixing indexed and "
-                                + "unindexed fragments"));
-        resolvedQuery = resolvedQuery.toBuilder().distanceType(indexMetric).build();
+        if (snapshot.metric == null) {
+          throw new IllegalArgumentException(
+              "Cannot determine the distance metric for vector index '"
+                  + snapshot.indexName
+                  + "'; pass distance_type explicitly before mixing indexed and unindexed "
+                  + "fragments");
+        }
+        resolvedQuery = resolvedQuery.toBuilder().distanceType(snapshot.metric).build();
       }
       // A quantized index reports quantized distances while a flat unit reports exact ones, and
       // the merge ranks them against each other. refine_factor makes an indexed unit re-score
@@ -334,25 +293,193 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
       }
 
       List<LanceDistributedSearchInputPartition> units =
-          planUnits(indexedQuery, resolvedQuery, liveSegments, fallbackFragments);
+          planUnits(indexedQuery, resolvedQuery, snapshot.liveSegments, snapshot.fallbackFragments);
 
       long indexedCount = units.stream().filter(u -> !u.getIndexSegments().isEmpty()).count();
       logBatchChunking(resolvedQuery, units.size(), indexedCount);
       LOG.info(
           "Lance distributed vector search: scanId={}, column={}, indexName={}, units={} "
-              + "(indexed={}, fallback={}), candidateK={}",
+              + "(indexed={}, fallback={}), candidateK={}, metadataCacheHit={}",
           scanId,
-          column,
-          vectorIndex.map(VectorIndexInfo::getIndexName).orElse("none"),
+          snapshot.column,
+          snapshot.indexName == null ? "none" : snapshot.indexName,
           units.size(),
           indexedCount,
           units.size() - indexedCount,
-          resolvedQuery.getK());
+          resolvedQuery.getK(),
+          metadataHit);
 
       return units.toArray(new InputPartition[0]);
     } finally {
       dataset.close();
     }
+  }
+
+  /**
+   * Everything planning shares with a later query on the same version: the fragments that exist,
+   * the index that was selected with its live segments, and the column and metric the units were
+   * built with.
+   */
+  static final class PlanSnapshot {
+    private final Set<Integer> fragments;
+    private final List<UUID> liveSegments;
+    private final Set<Integer> fallbackFragments;
+    private final String column;
+    private final String indexName;
+    private final String metric;
+    private final boolean discoveryFailed;
+
+    PlanSnapshot(
+        Set<Integer> fragments,
+        List<UUID> liveSegments,
+        Set<Integer> fallbackFragments,
+        String column,
+        String indexName,
+        String metric,
+        boolean discoveryFailed) {
+      this.fragments = Collections.unmodifiableSet(new HashSet<>(fragments));
+      this.liveSegments = Collections.unmodifiableList(new ArrayList<>(liveSegments));
+      this.fallbackFragments = Collections.unmodifiableSet(new TreeSet<>(fallbackFragments));
+      this.column = column;
+      this.indexName = indexName;
+      this.metric = metric;
+      this.discoveryFailed = discoveryFailed;
+    }
+  }
+
+  /**
+   * Reads the version-scoped planning metadata from the dataset: its fragments, the vector index
+   * selected for this query, the live segments, and the column and metric to search them with.
+   */
+  private PlanSnapshot discover(Dataset dataset) {
+    Set<Integer> existingFragments = new HashSet<>();
+    for (Fragment fragment : dataset.getFragments()) {
+      existingFragments.add(fragment.getId());
+    }
+
+    boolean fastSearch = Boolean.TRUE.equals(query.getFastSearch());
+    boolean bypassVectorIndex = Boolean.TRUE.equals(query.getBypassVectorIndex());
+    String requestedIndex = query.getIndexName();
+    if (requestedIndex != null && requestedIndex.isEmpty()) {
+      // An empty name is a mistake, not "no name": treating it as absent would run some other
+      // index while the caller believes they picked one.
+      throw new IllegalArgumentException(
+          "index must name a vector index; an empty name cannot select one");
+    }
+    boolean[] discoveryFailed = new boolean[] {false};
+    long discoveryStart = System.nanoTime();
+    NamedVectorIndex namedIndex;
+    String column;
+    Optional<VectorIndexInfo> vectorIndex;
+    try {
+      namedIndex =
+          requestedIndex != null
+              ? resolveNamedVectorIndex(dataset, requestedIndex, query.getVectorColumn())
+              : null;
+      // A named index decides the column, even when the search bypasses the index: the caller
+      // named an index, so the column it was built on is the one they mean.
+      column = namedIndex != null ? namedIndex.column : resolveVectorColumn();
+      if (namedIndex != null && bypassVectorIndex) {
+        // bypass_vector_index means "do not search an index"; naming one is not a conflict worth
+        // failing on, but it must not look as if the named index was used.
+        LOG.warn("Ignoring index {} because bypass_vector_index=true", requestedIndex);
+      }
+      vectorIndex =
+          bypassVectorIndex
+              ? Optional.empty()
+              : selectVectorIndex(
+                  dataset,
+                  column,
+                  query.getDistanceType(),
+                  fastSearch,
+                  namedIndex == null ? null : namedIndex.description,
+                  namedIndex == null ? null : namedIndex.allIndices,
+                  discoveryFailed);
+    } finally {
+      driverIndexDiscoveryTimeNs = System.nanoTime() - discoveryStart;
+    }
+
+    // A segment whose fragments are all gone (compaction, deletion) is stale: no unit for it.
+    Set<Integer> fallbackFragments = new TreeSet<>(existingFragments);
+    List<UUID> liveSegments = new ArrayList<>();
+    if (vectorIndex.isPresent()) {
+      for (VectorIndexSegment segment : vectorIndex.get().getSegments()) {
+        fallbackFragments.removeAll(segment.getFragmentIds());
+        if (!Collections.disjoint(segment.getFragmentIds(), existingFragments)) {
+          liveSegments.add(segment.getUuid());
+        }
+      }
+    }
+    if (fastSearch) {
+      fallbackFragments.clear();
+    }
+
+    return new PlanSnapshot(
+        existingFragments,
+        liveSegments,
+        fallbackFragments,
+        column,
+        vectorIndex.map(VectorIndexInfo::getIndexName).orElse(null),
+        vectorIndex.map(info -> info.getMetric().orElse(null)).orElse(null),
+        discoveryFailed[0]);
+  }
+
+  /** The planning cache, configured from the active session, or null when it is switched off. */
+  private SearchPlanCache<PlanSnapshot> metadataCache() {
+    int entries = 0;
+    try {
+      SparkSession spark = SparkSession.active();
+      if (spark.conf().get(SearchPlanCache.ENABLED_CONF, "true").equalsIgnoreCase("true")) {
+        String configured =
+            spark
+                .conf()
+                .get(SearchPlanCache.ENTRIES_CONF, String.valueOf(SearchPlanCache.DEFAULT_ENTRIES))
+                .trim();
+        entries = Math.max(Integer.parseInt(configured), 0);
+      }
+    } catch (RuntimeException e) {
+      // No active session while planning would be a bug elsewhere; planning without the cache is
+      // still correct, so say so rather than failing the query.
+      LOG.debug("Lance search metadata cache disabled: no active session ({})", e.getMessage());
+    }
+    METADATA_CACHE.configure(entries);
+    return entries > 0 ? METADATA_CACHE : null;
+  }
+
+  /**
+   * The cache key: the resolved table, the pinned snapshot it was planned on, and every request
+   * knob that can select a different index, column or metric.
+   */
+  private SearchPlanCache.Key cacheKey(LanceRef pinnedRef) {
+    LanceSparkReadOptions options = query.getReadOptions();
+    // The namespace identity is part of the resource: a table id is only unique inside one
+    // namespace root, so two tables with the same id must not answer each other's plan.
+    String resource =
+        DatasetLease.identityDigest(
+                options, query.getNamespaceImpl(), query.getNamespaceProperties())
+            + ";"
+            + DatasetLease.resourceIdentity(options);
+    String knobs =
+        "column="
+            + query.getVectorColumn()
+            + ";index="
+            + query.getIndexName()
+            + ";metric="
+            + query.getDistanceType()
+            + ";fast="
+            + query.getFastSearch()
+            + ";bypass="
+            + query.getBypassVectorIndex();
+    return SearchPlanCache.Key.of(resource, pinnedRef.toString(), knobs);
+  }
+
+  /** The process-wide driver cache; a new scan reuses what an earlier query on this version did. */
+  private static final SearchPlanCache<PlanSnapshot> METADATA_CACHE =
+      new SearchPlanCache<>(SearchPlanCache.DEFAULT_ENTRIES);
+
+  /** Exposed so tests can start from an empty cache and read the hit counters. */
+  static SearchPlanCache<PlanSnapshot> metadataCacheForTest() {
+    return METADATA_CACHE;
   }
 
   private List<LanceDistributedSearchInputPartition> planUnits(
@@ -361,15 +488,16 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
       List<UUID> liveSegments,
       Set<Integer> fallbackFragments) {
     List<LanceDistributedSearchInputPartition> units = new ArrayList<>();
+    DatasetLeaseSettings leaseSettings = DatasetLeaseSettings.fromActiveSession();
     for (UUID segmentUuid : liveSegments) {
       units.add(
           LanceDistributedSearchInputPartition.forIndexSegment(
-              schema, indexedQuery, segmentUuid, batchChunkPlan, scanId));
+              schema, indexedQuery, segmentUuid, batchChunkPlan, scanId, leaseSettings));
     }
     for (Integer fragmentId : fallbackFragments) {
       units.add(
           LanceDistributedSearchInputPartition.forFragment(
-              schema, fallbackQuery, fragmentId, batchChunkPlan, scanId));
+              schema, fallbackQuery, fragmentId, batchChunkPlan, scanId, leaseSettings));
     }
     return units;
   }
@@ -548,7 +676,8 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
       String requestedMetric,
       boolean fastSearch,
       IndexDescription namedIndex,
-      List<IndexDescription> knownIndices) {
+      List<IndexDescription> knownIndices,
+      boolean[] discoveryFailed) {
     List<IndexDescription> indices;
     if (knownIndices != null) {
       // The named path already listed the indexes; asking the dataset again would read the same
@@ -558,6 +687,7 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
       try {
         indices = dataset.describeIndices(new IndexCriteria.Builder().build());
       } catch (Exception e) {
+        discoveryFailed[0] = true;
         failFastSearchWhenIndexDiscoveryFails(fastSearch, e);
         LOG.warn("describeIndices failed, falling back to flat search: {}", e.getMessage());
         return Optional.empty();
@@ -577,7 +707,7 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
     Optional<IndexDescription> selected =
         namedIndex != null
             ? Optional.of(namedIndex)
-            : firstIndexOnColumn(dataset, indices, columnFieldId);
+            : firstIndexOnColumn(dataset, indices, columnFieldId, discoveryFailed);
     if (!selected.isPresent()) {
       return Optional.empty();
     }
@@ -639,7 +769,10 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
    * supply the segments and metric but cannot make the choice.
    */
   private static Optional<IndexDescription> firstIndexOnColumn(
-      Dataset dataset, List<IndexDescription> indices, int columnFieldId) {
+      Dataset dataset,
+      List<IndexDescription> indices,
+      int columnFieldId,
+      boolean[] discoveryFailed) {
     Map<String, IndexDescription> vectorIndexesByName = new HashMap<>();
     for (IndexDescription idx : indices) {
       if (isVectorIndex(idx)) {
@@ -653,6 +786,7 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
     try {
       manifestOrder = dataset.getIndexes();
     } catch (Exception e) {
+      discoveryFailed[0] = true;
       LOG.warn("getIndexes failed, keeping the name-sorted order: {}", e.getMessage());
       manifestOrder = Collections.emptyList();
     }

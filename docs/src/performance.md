@@ -255,6 +255,40 @@ the scanner reports zeros for every IO counter. The counters are published when 
 so a task that is cancelled or stopped early — a `LIMIT` above the search that lets Spark stop
 reading — can show zeros even though it did the work.
 
+### Dataset lease and planning reuse
+
+A distributed search opens the dataset in every task and reads the fragment list and the vector
+index metadata in every planning pass. Both are version-fixed, so a later task or query on the same
+version reuses them. Three counters make the effect visible:
+
+- `numDatasetOpens` is the number of datasets the task had to open. Without the lease it equals the
+  number of search tasks; with it, one task per executor opens and the rest report
+  `numDatasetLeaseHits`.
+- `datasetOpenTimeNs` is the cost that disappears with those opens.
+- `driverIndexDiscoveryTimeNs` drops to zero on a query whose version was already planned on this
+  driver.
+
+A local run of an eight-insert table (32 fragments, 32 search tasks, four local slots, no
+cross-process IO) shows the shape of the saving:
+
+| | opens | lease hits | `datasetOpenTimeNs`, summed over tasks | `driverIndexDiscoveryTimeNs` |
+| --- | --- | --- | --- | --- |
+| one query, lease off | 32 | 0 | 75.1 ms | n/a (five-fragment case: 7.3 ms) |
+| one query, lease on | 1 | 31 | 10.2 ms | 5.6 ms cold, 0 ms on the second query |
+
+These are per-JVM numbers on a local dataset: they show that the open is a real per-task cost and
+that the reuse removes it, not what a 10M-row table on a cluster will save. Reward the numbers on
+the cluster, where an open also costs an object-store metadata round trip and, with executor
+credential refresh, a `describeTable` call. The saving is bounded by design: an entry older than
+`spark.sql.lance.search.dataset.lease.max.age.ms` is reopened rather than reused, which is what
+keeps a reused namespace client from serving past its credentials' lifetime.
+
+What the lease deliberately does not do: it never reuses across versions, credentials or namespace
+roots, and it does not lease "latest" — only a reference that pins a concrete version, which is what
+the planner hands each task. A read whose options say "latest" (the deferred payload fetch, as it
+runs today) opens per consumer exactly as before, so the mechanism can be turned off without
+changing a single row of the answer.
+
 ### Custom Write Metrics
 
 The write path reports two per-task metrics.

@@ -42,6 +42,8 @@ public class LanceReadMetricsTracker {
   private long numIndexCacheHits;
   private long numIndexCacheMisses;
   private long datasetOpenTimeNs;
+  private long numDatasetOpens;
+  private long numDatasetLeaseHits;
   private long scannerCreateTimeNs;
   private long batchLoadTimeNs;
 
@@ -182,6 +184,28 @@ public class LanceReadMetricsTracker {
         new CustomTaskMetric() {
           @Override
           public String name() {
+            return LanceCustomMetrics.NUM_DATASET_OPENS;
+          }
+
+          @Override
+          public long value() {
+            return numDatasetOpens;
+          }
+        },
+        new CustomTaskMetric() {
+          @Override
+          public String name() {
+            return LanceCustomMetrics.NUM_DATASET_LEASE_HITS;
+          }
+
+          @Override
+          public long value() {
+            return numDatasetLeaseHits;
+          }
+        },
+        new CustomTaskMetric() {
+          @Override
+          public String name() {
             return LanceCustomMetrics.SCANNER_CREATE_TIME_NS;
           }
 
@@ -217,6 +241,16 @@ public class LanceReadMetricsTracker {
 
   public void addDatasetOpenTimeNs(long ns) {
     datasetOpenTimeNs += ns;
+  }
+
+  /** One acquisition of a dataset lease: either this task opened it or it reused an open. */
+  public void addDatasetLease(boolean opened, boolean reused) {
+    if (opened) {
+      numDatasetOpens++;
+    }
+    if (reused) {
+      numDatasetLeaseHits++;
+    }
   }
 
   public void addScannerCreateTimeNs(long ns) {
@@ -293,5 +327,13 @@ public class LanceReadMetricsTracker {
 
   public long getNumIndexComparisons() {
     return numIndexComparisons;
+  }
+
+  public long getNumDatasetOpens() {
+    return numDatasetOpens;
+  }
+
+  public long getNumDatasetLeaseHits() {
+    return numDatasetLeaseHits;
   }
 }

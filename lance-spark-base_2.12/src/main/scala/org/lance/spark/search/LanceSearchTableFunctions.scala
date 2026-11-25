@@ -24,6 +24,7 @@ import org.apache.spark.sql.types.{ArrayType, DataTypes, MapType, StructField, S
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.lance.ipc.FullTextQuery
 import org.lance.spark.{LanceDataset, LanceSparkReadOptions}
+import org.lance.spark.internal.DatasetLeaseSettings
 import org.lance.spark.search.LanceSearchQuery.SearchType
 import org.lance.spark.utils.{FullTextQueryUtils, Utils}
 
@@ -569,7 +570,8 @@ object LanceSearchTableFunctions {
         query.getReadOptions,
         resolved.table.getInitialStorageOptions,
         query.getNamespaceImpl,
-        query.getNamespaceProperties),
+        query.getNamespaceProperties,
+        DatasetLeaseSettings.fromActiveSession),
       settings.chunkRows,
       versionPin)
   }

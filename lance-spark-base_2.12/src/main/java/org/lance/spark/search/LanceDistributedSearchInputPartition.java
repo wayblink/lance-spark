@@ -13,6 +13,8 @@
  */
 package org.lance.spark.search;
 
+import org.lance.spark.internal.DatasetLeaseSettings;
+
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.types.StructType;
 
@@ -39,6 +41,7 @@ public class LanceDistributedSearchInputPartition implements InputPartition {
   private final List<Integer> fragmentIds;
   private final List<UUID> indexSegments;
   private final LanceBatchChunkPlan batchChunkPlan;
+  private final DatasetLeaseSettings leaseSettings;
 
   /**
    * The planning scan's tracing id, carried along so an executor log line can be tied back to the
@@ -53,13 +56,15 @@ public class LanceDistributedSearchInputPartition implements InputPartition {
       List<Integer> fragmentIds,
       List<UUID> indexSegments,
       LanceBatchChunkPlan batchChunkPlan,
-      String scanId) {
+      String scanId,
+      DatasetLeaseSettings leaseSettings) {
     this.schema = schema;
     this.query = query;
     this.fragmentIds = fragmentIds;
     this.indexSegments = indexSegments;
     this.batchChunkPlan = batchChunkPlan;
     this.scanId = scanId;
+    this.leaseSettings = leaseSettings;
   }
 
   /** An indexed unit: search one segment of a vector index through {@code indexSegments(...)}. */
@@ -68,14 +73,16 @@ public class LanceDistributedSearchInputPartition implements InputPartition {
       LanceSearchQuery query,
       UUID segmentUuid,
       LanceBatchChunkPlan batchChunkPlan,
-      String scanId) {
+      String scanId,
+      DatasetLeaseSettings leaseSettings) {
     return new LanceDistributedSearchInputPartition(
         schema,
         query,
         Collections.emptyList(),
         Collections.singletonList(Objects.requireNonNull(segmentUuid, "segmentUuid")),
         Objects.requireNonNull(batchChunkPlan, "batchChunkPlan"),
-        scanId);
+        scanId,
+        leaseSettings);
   }
 
   /** A fallback unit: flat KNN over one fragment no index segment covers. */
@@ -84,14 +91,16 @@ public class LanceDistributedSearchInputPartition implements InputPartition {
       LanceSearchQuery query,
       int fragmentId,
       LanceBatchChunkPlan batchChunkPlan,
-      String scanId) {
+      String scanId,
+      DatasetLeaseSettings leaseSettings) {
     return new LanceDistributedSearchInputPartition(
         schema,
         query,
         Collections.singletonList(fragmentId),
         Collections.emptyList(),
         Objects.requireNonNull(batchChunkPlan, "batchChunkPlan"),
-        scanId);
+        scanId,
+        leaseSettings);
   }
 
   public StructType getSchema() {
@@ -121,5 +130,10 @@ public class LanceDistributedSearchInputPartition implements InputPartition {
   /** The planning scan's tracing id, for correlating executor logs with the driver's. */
   public String getScanId() {
     return scanId;
+  }
+
+  /** The dataset lease settings this unit must run with, resolved on the driver. */
+  public DatasetLeaseSettings getLeaseSettings() {
+    return leaseSettings;
   }
 }

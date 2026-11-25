@@ -196,6 +196,44 @@ payload columns are read, and it verifies each fetched row id rather than trusti
 Executors refresh namespace credentials for the fetch the same way the search tasks do, and the
 credentials themselves are kept out of the plan text.
 
+### Dataset lease and planning cache
+
+A distributed search opens the dataset once per task, and planning reads the fragment list and the
+vector-index metadata once per query. Both are fixed by the dataset version, so both are reused:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `spark.sql.lance.search.dataset.lease.enabled` | `true` | Reuse an opened dataset on the executor when a later task searches the same pinned version under the same credentials. `false` restores one open per task. |
+| `spark.sql.lance.search.dataset.lease.max.entries` | `8` | Idle datasets one executor keeps open, least recently used evicted first. `0` behaves like the lease being off. |
+| `spark.sql.lance.search.dataset.lease.max.age.ms` | `60000` | Maximum age of a reused dataset. After it, the dataset and the executor-side namespace client behind it are rebuilt, which bounds how long a client may serve before credentials are re-fetched. |
+| `spark.sql.lance.search.dataset.lease.idle.timeout.ms` | `60000` | Idle time after which an unused dataset is closed. |
+| `spark.sql.lance.search.metadata.cache.enabled` | `true` | Reuse the driver's planning metadata (fragments, selected index, its segments, column and metric) for a version that was already planned. |
+| `spark.sql.lance.search.metadata.cache.entries` | `8` | Versions whose planning metadata is kept on the driver, least recently used evicted first. `0` disables the cache. |
+
+The lease key is the catalog, the namespace identity, the table (or dataset URI), the pinned
+version, a digest of the storage options, and the open variant (block and cache sizes). A dataset is
+only leased when the read options pin a concrete version, which the distribution planner always
+does: "latest" or a moving tag would turn a reuse into a query that silently reads an older
+snapshot. Rotated credentials are a different key, so a reuse never crosses a credential change; the
+maximum age bounds the namespace client even when the credentials are byte-identical.
+
+The planning cache is keyed the same way plus the knobs that select an index, column or metric
+(`index`, `vector_column`, `distance_type`, `fast_search`, `bypass_vector_index`). It is only used
+for a version that has already been planned, and a discovery that fell back to flat search because
+the index listing failed is never cached. The driver still opens the dataset per query when the
+query asks for "latest", because that open is how the version is resolved; a pinned `version => N`
+query re-plans from the cache without re-reading anything.
+
+#### When there is no benefit
+
+The lease saves nothing when every task already runs on its own executor JVM (one task per
+executor), when each task's search dominates its open cost, or when the credentials change on every
+query. It also does not help a search whose read options carry no pinned version, such as the
+deferred payload fetch as it runs today. The planning cache helps repeated queries against one
+version and does nothing for a table that commits between queries, since each version is planned
+once. Turning both off changes performance only: results, recall, the ranking contract and the pin
+semantics are identical.
+
 ## Cache Backends
 
 Each Spark catalog owns an isolated Lance `Session`. Select registered native cache backends for

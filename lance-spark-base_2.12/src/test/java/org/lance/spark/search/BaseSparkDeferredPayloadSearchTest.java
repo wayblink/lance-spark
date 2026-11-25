@@ -490,7 +490,8 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
             org.lance.spark.LanceSparkReadOptions.from("file:///tmp/x.lance"),
             storage,
             "dir",
-            java.util.Collections.singletonMap("root", "/tmp"));
+            java.util.Collections.singletonMap("root", "/tmp"),
+            org.lance.spark.internal.DatasetLeaseSettings.defaults());
 
     assertFalse(source.toString().contains("SENTINEL3258"), source.toString());
     assertFalse(source.toString().contains("aws_secret_access_key"), source.toString());

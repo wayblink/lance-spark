@@ -14,8 +14,7 @@
 package org.lance.spark.search;
 
 import org.lance.Dataset;
-import org.lance.spark.internal.ExecutorNamespace;
-import org.lance.spark.utils.Utils;
+import org.lance.spark.internal.DatasetLease;
 import org.lance.spark.vectorized.LanceArrowColumnVector;
 
 import org.apache.arrow.vector.FieldVector;
@@ -231,18 +230,21 @@ public final class LancePayloadFetcher implements Serializable {
       return narrowOnly(rowIds, distances, queryIndexes);
     }
 
+    final DatasetLease.Handle lease;
     final Dataset dataset;
-    final ExecutorNamespace executorNamespace;
     try {
       // Same credential handling as the search tasks: a long fetch must not run on an STS token
-      // that expired while the first phase was scanning.
-      executorNamespace =
-          ExecutorNamespace.acquire(
-              source.readOptions(), source.namespaceImpl(), source.namespaceProperties());
-      dataset =
-          Utils.openDatasetBuilder(source.readOptions())
-              .initialStorageOptions(source.initialStorageOptions())
-              .build();
+      // that expired while the first phase was scanning. The lease is the same mechanism the
+      // search tasks use, so a fetch that runs on an executor which still has the search task's
+      // dataset cached reuses it instead of opening the same snapshot again.
+      lease =
+          DatasetLease.acquire(
+              source.readOptions(),
+              source.initialStorageOptions(),
+              source.namespaceImpl(),
+              source.namespaceProperties(),
+              source.leaseSettings());
+      dataset = lease.dataset();
     } catch (RuntimeException e) {
       throw new IllegalStateException(
           "Failed to open the dataset for the deferred search payload of "
@@ -288,11 +290,7 @@ public final class LancePayloadFetcher implements Serializable {
           return;
         }
         closed = true;
-        try {
-          dataset.close();
-        } finally {
-          executorNamespace.close();
-        }
+        lease.close();
       }
     };
   }

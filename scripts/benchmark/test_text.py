@@ -200,7 +200,17 @@ class TextSubmitTests(unittest.TestCase):
         vector_conf, vector_command = submit.cell_command(
             self.contract, "single", 10, "b.jar", "/e/contract.json", "/e/truth.json",
             "/e/single-k10", "b3255-single-k10-x", {})
-        self.assertEqual(set(conf), set(vector_conf))
+        # The text cell adds exactly one conf of its own: `lance_match` resolves through the
+        # default catalog, so the Lance catalog has to be the default for this cell only.
+        extra = set(conf) - set(vector_conf)
+        self.assertEqual(extra, {"spark.sql.defaultCatalog"})
+        self.assertEqual(conf["spark.sql.defaultCatalog"], "lance")
+        # The cells differ only in their own identity (pod name, evidence root), not in policy.
+        per_cell = {"spark.kubernetes.driver.pod.name", "spark.eventLog.dir"}
+        for key in vector_conf:
+            if key in per_cell:
+                continue
+            self.assertEqual(conf[key], vector_conf[key], key)
         self.assertEqual(conf["spark.executor.instances"], "12")
         self.assertEqual(command[0], vector_command[0])
         self.assertEqual(command[:6], vector_command[:6])

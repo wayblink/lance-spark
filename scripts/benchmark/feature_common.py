@@ -38,10 +38,10 @@ BASELINE_SHA256 = "a29c97557f178e877ff9c9d29c42dfd186e13ffce3fde250ef427520342a1
 # -- foreign benchmark activity is recorded, coverage/API/marker failures still void a cell -- and
 # the text BM25 k=10 cell added by card #3285). Anything else is refused before ssh.
 RUNNER_SHA256 = {
-    "submit.py": "53bf754e4271f2cc6f7340d2d5a25e1bd055118476f68513b621fec9507b35ea",
-    "baseline.py": "5c9f31f5c57c2be3f3b0c30cd0b26eeba268021f9ac3ab0558919583838a0420",
+    "submit.py": "7a3110bbcbf3d71b6ec636aae9fc25ed048642027a240c8e4fb12a96c96cce43",
+    "baseline.py": "cbd7264fc9824b2456c379784d3e0385d02a96ad8a44bc8688ccab6a22531427",
     "pilot.py": "1e9f57b422cf98b98b62c87eb9c28d42b5f1c3931b5a026267389c4cedc1c9d7",
-    "benchmark.py": "845231d665829d806b3a8dc8f3c92227da25e19281b342aada0e436c0a76f76d",
+    "benchmark.py": "654c4b122daae926fa7ebdc98f092b58da04584a0d4a81af63b2154a690792c9",
     "BaselineBenchmark.java": "258dbcde51da43c59dc57c893a2d0138bef0f4b6b77faf52a5a08ce8a1e7a4d2",
     "verified-stopped-drivers.json": "299287912c4dba978ef58c4333c2a7337444d5b92cffc027a39244e340577db8",
     "text-10m.json": "efba1225617f4497ca8984b2186d4b1c9156c7c9955f79c44c83099a9de62c2f",

@@ -240,13 +240,17 @@ def validate_run(records, eventlog_present):
             "samples": sum(map(len, observed.values()))}
 
 
-def validate_matrix(records, eventlog_present, text=False):
+def validate_matrix(records, eventlog_present, text=False, text_only=False):
     required = {("single", 10), ("single", 100), ("single", 2000), ("batch", 100), ("batch", 2000)}
-    if text:
+    if text_only:
+        require(text, "text-only matrix requires the text cell")
+        required = set(text_cells())
+    elif text:
         required |= set(text_cells())
     require({(x.get("kind"), x.get("k")) for x in records} == required,
             "full baseline requires exactly five fixed cells" if not text
-            else "text matrix requires the five fixed cells plus text-k10")
+            else ("text-only matrix requires exactly text-k10" if text_only
+                  else "text matrix requires the five fixed cells plus text-k10"))
     return validate_run(records, eventlog_present)
 
 

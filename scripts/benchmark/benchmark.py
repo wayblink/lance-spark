@@ -43,6 +43,8 @@ def main():
                    help="append the optional text BM25 k=10 cell after the five vector cells")
     p.add_argument("--text-contract", type=Path, default=HERE/"text-10m.json",
                    help="frozen text cell contract (default scripts/benchmark/text-10m.json)")
+    p.add_argument("--text-only", action="store_true",
+                   help="run only the text cell; requires --text-cell (for arm-vs-arm text comparison)")
     a=p.parse_args();c=json.loads(a.contract.read_text())
     if a.run:
         if not a.approved:
@@ -51,7 +53,8 @@ def main():
         if a.text_cell:
             submit.run_matrix(c, a.contract, Path(a.queries), Path(a.truth), Path(a.output_root),
                               a.window_seconds, a.stopped_evidence,
-                              text_cell=True, text_contract_path=a.text_contract)
+                              text_cell=True, text_contract_path=a.text_contract,
+                              text_only=a.text_only)
         else:
             submit.run_matrix(c, a.contract, Path(a.queries), Path(a.truth), Path(a.output_root),
                               a.window_seconds, a.stopped_evidence)
@@ -63,6 +66,9 @@ def main():
     if a.text_cell:
         import submit
         payload["text_cell"]=submit.text_cell_plan(c, a.text_contract)
+        payload["text_only"]=a.text_only
+        if a.text_only:
+            payload["cells"]=[]
     print(json.dumps(payload,indent=2))
 
 

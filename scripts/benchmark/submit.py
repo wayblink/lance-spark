@@ -381,8 +381,15 @@ def cell_command(c, kind, k, jar, remote_contract, remote_truth, remote, name, s
 
 
 def text_cell_command(c, text, jar, remote, name, storage):
-    """The optional sixth cell: same conf/scheduling, only the JVM payload differs."""
+    """The optional sixth cell: same conf/scheduling, only the JVM payload differs.
+
+    ``lance_match`` is resolved through the *default* catalog's function catalog, so the text cell
+    has to name the Lance catalog as the default. The five vector cells call ``VECTOR_SEARCH`` with
+    a fully qualified table and never touch the default catalog, so their frozen conf stays as it
+    was - this one conf is text-only and is recorded with the cell's evidence.
+    """
     conf=_cell_conf(c,name,remote,storage)
+    conf["spark.sql.defaultCatalog"]=c["table"].split(".",1)[0]
     return conf,_submit_command(c,conf,jar,[text["remote_contract"],text["remote_asset"],
                                             remote+"/samples.jsonl","text",str(text["k"])],name)
 
@@ -603,12 +610,17 @@ def load_stopped_evidence(path):
 
 
 def run_matrix(c,contract_path,queries_path,truth_path,output,window_seconds=1800,stopped_evidence=None,
-               text_cell=False,text_contract_path=None):
+               text_cell=False,text_contract_path=None,text_only=False):
     """Run the five frozen vector cells, then the optional text cell, under one lifecycle.
 
     ``text_cell=False`` keeps the historical five-cell matrix byte-for-byte; enabling it only
     appends text-k10 after batch-k2000 and counts it in matrix-verdict.cells/samples.
+
+    ``text_only`` runs just the text cell: the two arms of a text comparison differ by image and
+    nothing else, so measuring the five vector cells again would only burn a window and produce
+    numbers the vector table already has. It requires ``text_cell``.
     """
+    baseline.require(not text_only or text_cell,"--text-only requires --text-cell")
     if text_cell:
         baseline.require(text_contract_path is not None,"--text-cell requires a frozen text contract")
         ctx=prepare_matrix(c,contract_path,queries_path,truth_path,output,stopped_evidence,
@@ -616,19 +628,20 @@ def run_matrix(c,contract_path,queries_path,truth_path,output,window_seconds=180
     else:
         ctx=prepare_matrix(c,contract_path,queries_path,truth_path,output,stopped_evidence)
     out=ctx["output"];secrets=ctx["secrets"];records=[];verdicts=[]
-    cells=baseline.cells(c)+(baseline.text_cells() if text_cell else [])
+    cells=([] if text_only else baseline.cells(c))+(baseline.text_cells() if text_cell else [])
     try:
         for kind,k in cells:
             cell_records,verdict=run_one_cell(ctx,kind,k,window_seconds)
             records += cell_records;verdicts.append(verdict)
-        summary=baseline.validate_matrix(records,True,text=text_cell)
+        summary=baseline.validate_matrix(records,True,text=text_cell,text_only=text_only)
         usable=[verdict for verdict in verdicts if verdict.get("window_usable") is True]
         clean=[verdict for verdict in verdicts if verdict.get("exclusive_window_valid") is True]
         result={"complete":len(usable)==len(verdicts)==len(cells),
             "cells":len(cells),"cells_usable":len(usable),"cells_clean":len(clean),
             "contaminated_cells":[cell_name(v) for v in verdicts if v.get("contamination")],
             "window_wait_exhausted_cells":[cell_name(v) for v in verdicts if v.get("window_wait_exhausted") is True],
-            "samples":summary["samples"],"cache_residency":"unknown","text_cell":text_cell}
+            "samples":summary["samples"],"cache_residency":"unknown","text_cell":text_cell,
+            "text_only":text_only}
         if text_cell:
             result["text_queries_sha256"]=ctx["text"]["queries_sha256"]
         store(out,"matrix-verdict.json",result,secrets)

@@ -23,6 +23,14 @@ import java.util.List;
 
 /** Keeps the internal columns required by a search plan while pruning payload columns. */
 final class LanceSearchProjection {
+  /**
+   * Column lance-core appends to a batch search result, naming the query each row belongs to. The
+   * batch plan builds it in {@code LanceSearchTableFunctions.QueryIndexColumn}; this Java side only
+   * has to recognize it as connector-internal, so the value is repeated here rather than reaching
+   * into the Scala object.
+   */
+  static final String QUERY_INDEX = "query_index";
+
   private LanceSearchProjection() {}
 
   static LanceSearchQuery prune(LanceSearchQuery query, StructType requiredSchema) {
@@ -46,9 +54,9 @@ final class LanceSearchProjection {
   }
 
   private static boolean isInternal(LanceSearchQuery query, String name) {
-    // `_distance` and `_score` are generated result columns and remain in the native request. Only
-    // row id and a batch's query_index are connector-internal physical columns.
+    // `_distance` is a generated result column and stays in the native request. Only the row id
+    // and a batch's query_index are connector-internal physical columns.
     return name.equalsIgnoreCase(LanceConstant.ROW_ID)
-        || (query.isBatch() && name.equalsIgnoreCase("query_index"));
+        || (query.isBatch() && name.equalsIgnoreCase(QUERY_INDEX));
   }
 }

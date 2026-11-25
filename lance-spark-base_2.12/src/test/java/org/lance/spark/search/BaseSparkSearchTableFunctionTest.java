@@ -105,6 +105,28 @@ public abstract class BaseSparkSearchTableFunctionTest {
   }
 
   @Test
+  public void testVectorSearchProjectionWithoutDistanceColumn() {
+    String fullName = createVectorTable();
+
+    // `_distance` is ranking state rather than a column the caller must select: a projection that
+    // omits it still returns the same top-k, and the native scan is asked for `id` only.
+    List<Integer> baselineIds =
+        idsOf(
+            spark.sql(
+                "SELECT id, vector, _distance FROM VECTOR_SEARCH('"
+                    + fullName
+                    + "', array(0.0, 0.0, 0.0, 0.0), 2) ORDER BY _distance, id"));
+    List<Integer> projectedIds =
+        idsOf(
+            spark.sql(
+                "SELECT id FROM VECTOR_SEARCH('" + fullName + "', array(0.0, 0.0, 0.0, 0.0), 2)"));
+
+    assertEquals(Arrays.asList(0, 1), baselineIds);
+    Collections.sort(projectedIds);
+    assertEquals(baselineIds, projectedIds);
+  }
+
+  @Test
   public void testVectorSearchOffsetReturnsRequestedCount() {
     Assumptions.assumeTrue(supportsNamedArguments());
     String fullName = createVectorTable();
@@ -459,6 +481,10 @@ public abstract class BaseSparkSearchTableFunctionTest {
     assertTrue(searchRowId.getInt(0) == 1 || searchRowId.getInt(0) == 3);
     assertTrue(searchRowId.getFloat(1) > 0.0f);
     assertTrue(searchRowId.getLong(2) >= 0);
+  }
+
+  private List<Integer> idsOf(Dataset<Row> rows) {
+    return rows.collectAsList().stream().map(row -> row.getInt(0)).collect(Collectors.toList());
   }
 
   private String createVectorTable() {

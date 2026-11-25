@@ -46,7 +46,8 @@ FROM VECTOR_SEARCH(
 ORDER BY _distance;
 ```
 
-`SELECT *` keeps the full table projection. An explicit `columns => array(...)` remains authoritative and is recommended when the required output is known. Generated search fields such as `_distance`, `_score`, and the distributed tie-breaking `_rowid` remain available to the search plan; a projection containing only metadata fields may conservatively keep the original native projection to preserve Lance's empty-column semantics. Nested struct reads keep the full struct layout internally so Arrow child-field positions stay aligned.
+`SELECT *` keeps the full table projection. A narrower outer projection is pushed into the native search: the scan reads only the payload columns the query uses, plus the fields ranking depends on (`_distance`, and the distributed tie-breaking `_rowid`). An explicit `columns => array(...)` decides the visible output schema and is the authoritative way to say which columns the result exposes, but it is not a request to materialize each of them in the native scan - a projected column is read only when the outer query needs it. A projection made only of metadata fields may conservatively keep the original native projection to preserve Lance's empty-column semantics. Nested struct reads keep the full struct layout internally so Arrow child-field positions stay aligned.
+
 ## Positional Form
 
 Use positional arguments for simple calls and Spark 3.4 compatibility.

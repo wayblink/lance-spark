@@ -20,17 +20,24 @@ import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.types.StructType;
 
 public class LanceDistributedSearchScanBuilder implements SupportsPushDownRequiredColumns {
+  /** Search output schema before column pruning; the widening baseline for nested structs. */
+  private final StructType fullSchema;
+
   private StructType schema;
   private LanceSearchQuery query;
 
   public LanceDistributedSearchScanBuilder(StructType schema, LanceSearchQuery query) {
+    this.fullSchema = schema;
     this.schema = schema;
     this.query = query;
   }
 
   @Override
   public void pruneColumns(StructType requiredSchema) {
-    StructType widened = ReadSchemaNestedStructWidening.widenRequiredSchema(requiredSchema, schema);
+    // Widen against the immutable full schema, like the read path does: a second pruneColumns call
+    // must not derive nested structs from the schema the first call already rewrote.
+    StructType widened =
+        ReadSchemaNestedStructWidening.widenRequiredSchema(requiredSchema, fullSchema);
     schema = widened;
     query = LanceSearchProjection.prune(query, widened);
   }

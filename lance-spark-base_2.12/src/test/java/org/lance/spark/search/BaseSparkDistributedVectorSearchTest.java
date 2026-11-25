@@ -13,17 +13,19 @@
  */
 package org.lance.spark.search;
 
+import org.lance.ipc.ScanOptions;
 import org.lance.spark.read.metric.LanceCustomMetrics;
 
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.read.Batch;
+import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec;
 import org.apache.spark.sql.execution.adaptive.QueryStageExec;
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec;
-import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
@@ -350,36 +352,51 @@ public abstract class BaseSparkDistributedVectorSearchTest {
     List<Row> rows = result.collectAsList();
     assertEquals(2, rows.size());
     assertEquals(0, rows.get(0).getInt(0));
-    StructType scanSchema = findBatchScanSchema(result);
+    Scan scan = findSearchScan(result);
     assertEquals(
         java.util.Arrays.asList("id", "_distance", "_rowid"),
-        java.util.Arrays.asList(scanSchema.fieldNames()));
+        java.util.Arrays.asList(scan.readSchema().fieldNames()));
+
+    // The scan schema only proves what Spark sees; the payload read is saved by the native column
+    // list the workers send to Lance, which stays whole if pruneColumns stops pruning the query.
+    InputPartition[] units = ((Batch) scan).planInputPartitions();
+    assertTrue(units.length > 0, "expected at least one distributed search unit");
+    for (InputPartition unit : units) {
+      ScanOptions options =
+          LanceDistributedSearchColumnarPartitionReader.buildScanOptions(
+              (LanceDistributedSearchInputPartition) unit);
+      assertEquals(
+          java.util.Arrays.asList("id", "_distance"),
+          options.getColumns().orElse(java.util.Collections.emptyList()),
+          "native columns requested by one search unit");
+      assertTrue(options.isWithRowId(), "row id is fetched by flag, not as a payload column");
+    }
   }
 
-  private static StructType findBatchScanSchema(Dataset<Row> dataset) {
-    StructType schema = findBatchScanSchemaOrNull(dataset.queryExecution().executedPlan());
+  private static Scan findSearchScan(Dataset<Row> dataset) {
+    Scan scan = findSearchScanOrNull(dataset.queryExecution().executedPlan());
     assertTrue(
-        schema != null,
+        scan != null,
         "VECTOR_SEARCH BatchScanExec not found in " + dataset.queryExecution().executedPlan());
-    return schema;
+    return scan;
   }
 
-  private static StructType findBatchScanSchemaOrNull(SparkPlan plan) {
+  private static Scan findSearchScanOrNull(SparkPlan plan) {
     if (plan instanceof BatchScanExec) {
       Scan scan = ((BatchScanExec) plan).scan();
       if (scan.readSchema().fieldNames().length > 0
           && java.util.Arrays.asList(scan.readSchema().fieldNames()).contains("_distance")) {
-        return scan.readSchema();
+        return scan;
       }
     }
     if (plan instanceof AdaptiveSparkPlanExec) {
-      return findBatchScanSchemaOrNull(((AdaptiveSparkPlanExec) plan).executedPlan());
+      return findSearchScanOrNull(((AdaptiveSparkPlanExec) plan).executedPlan());
     }
     if (plan instanceof QueryStageExec) {
-      return findBatchScanSchemaOrNull(((QueryStageExec) plan).plan());
+      return findSearchScanOrNull(((QueryStageExec) plan).plan());
     }
     for (SparkPlan child : scala.collection.JavaConverters.seqAsJavaList(plan.children())) {
-      StructType result = findBatchScanSchemaOrNull(child);
+      Scan result = findSearchScanOrNull(child);
       if (result != null) return result;
     }
     return null;

@@ -27,12 +27,16 @@ import java.util.Arrays;
  *   <li>Counters use {@code num*} prefix (e.g. {@code numFragmentsScanned}).
  *   <li>Durations use {@code *TimeNs} suffix and extend {@link CustomNsTimeMetric} so the UI shows
  *       formatted values like "1.2 s" instead of raw nanoseconds.
- *   <li>Sizes use {@code *Bytes} suffix (reserved for future use).
+ *   <li>Sizes use {@code *Bytes} suffix (e.g. {@code numBytesRead}).
  * </ul>
  *
- * <p>Future metrics gated on upstream {@code lance-jni} surface (not implementable in pure Java
- * today): {@code numFragmentsPruned}, {@code bytesRead}, {@code numIndexLookups}, {@code
- * ioWaitTimeNs}, {@code decodeTimeNs}.
+ * <p>Counters Lance reports through {@code ScanStats} only exist when the scanner was asked to
+ * collect stats; the read path and the distributed-search path both ask for them. A scanner that
+ * was not asked reports nothing rather than zeros, so a zero hit/miss pair means "not measured or
+ * cache not consulted", not "everything missed".
+ *
+ * <p>Still gated on an upstream {@code lance-jni} surface (not implementable in pure Java today):
+ * {@code numFragmentsPruned}, {@code ioWaitTimeNs}, {@code decodeTimeNs}.
  */
 public final class LanceCustomMetrics {
   public static final String NUM_FRAGMENTS_SCANNED = "numFragmentsScanned";

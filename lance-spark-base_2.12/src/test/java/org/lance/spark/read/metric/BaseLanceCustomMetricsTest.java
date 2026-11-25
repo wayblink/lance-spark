@@ -62,8 +62,8 @@ public abstract class BaseLanceCustomMetricsTest {
                 LanceCustomMetrics.NUM_INDICES_LOADED,
                 LanceCustomMetrics.NUM_PARTS_LOADED,
                 LanceCustomMetrics.NUM_INDEX_COMPARISONS,
-                 "numIndexCacheHits",
-                 "numIndexCacheMisses",
+                LanceCustomMetrics.NUM_INDEX_CACHE_HITS,
+                LanceCustomMetrics.NUM_INDEX_CACHE_MISSES,
                 LanceCustomMetrics.DATASET_OPEN_TIME_NS,
                 LanceCustomMetrics.SCANNER_CREATE_TIME_NS,
                 LanceCustomMetrics.BATCH_LOAD_TIME_NS));
@@ -247,22 +247,22 @@ public abstract class BaseLanceCustomMetricsTest {
   void testCacheCountersSurviveScanStatsTransferAndMetricPolling() {
     LanceReadMetricsTracker tracker = new LanceReadMetricsTracker();
     tracker.addScanStats(
-        Optional.of(new ScanStats(3L, 2L, 128L, 1L, 4L, 32L, 7L, 5L,
-            new HashMap<>(), new HashMap<>())));
+        Optional.of(
+            new ScanStats(3L, 2L, 128L, 1L, 4L, 32L, 7L, 5L, new HashMap<>(), new HashMap<>())));
 
     Map<String, Long> first = metricValues(tracker);
-    assertEquals(Long.valueOf(7L), first.get("numIndexCacheHits"));
-    assertEquals(Long.valueOf(5L), first.get("numIndexCacheMisses"));
+    assertEquals(Long.valueOf(7L), first.get(LanceCustomMetrics.NUM_INDEX_CACHE_HITS));
+    assertEquals(Long.valueOf(5L), first.get(LanceCustomMetrics.NUM_INDEX_CACHE_MISSES));
     tracker.addScanStats(Optional.empty());
     assertEquals(first, metricValues(tracker), "polling and absent stats must not add work");
 
     // A table reader can finish several distinct fragment scanners: their counters add once each.
     tracker.addScanStats(
-        Optional.of(new ScanStats(1L, 1L, 64L, 0L, 2L, 16L, 11L, 2L,
-            new HashMap<>(), new HashMap<>())));
+        Optional.of(
+            new ScanStats(1L, 1L, 64L, 0L, 2L, 16L, 11L, 2L, new HashMap<>(), new HashMap<>())));
     Map<String, Long> second = metricValues(tracker);
-    assertEquals(Long.valueOf(18L), second.get("numIndexCacheHits"));
-    assertEquals(Long.valueOf(7L), second.get("numIndexCacheMisses"));
+    assertEquals(Long.valueOf(18L), second.get(LanceCustomMetrics.NUM_INDEX_CACHE_HITS));
+    assertEquals(Long.valueOf(7L), second.get(LanceCustomMetrics.NUM_INDEX_CACHE_MISSES));
   }
 
   private static Map<String, Long> metricValues(LanceReadMetricsTracker tracker) {

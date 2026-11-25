@@ -17,8 +17,10 @@ import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
 import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.TestUtils;
+import org.lance.spark.read.metric.LanceCustomMetrics;
 import org.lance.spark.search.LanceSearchQuery.SearchType;
 
+import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.Test;
@@ -30,6 +32,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -42,8 +45,30 @@ class LanceDistributedSearchScanTest {
   void readingDriverMetricsDoesNotOpenTheDataset() {
     LanceDistributedSearchScan scan = scanForPlanning("file:/missing-metrics-only-dataset");
     Map<String, Long> metrics = driverMetrics(scan);
-    assertEquals(Long.valueOf(0L), metrics.get("driverPlanningTimeNs"));
-    assertEquals(Long.valueOf(0L), metrics.get("driverIndexDiscoveryTimeNs"));
+    assertEquals(Long.valueOf(0L), metrics.get(LanceCustomMetrics.DRIVER_PLANNING_TIME_NS));
+    assertEquals(Long.valueOf(0L), metrics.get(LanceCustomMetrics.DRIVER_INDEX_DISCOVERY_TIME_NS));
+  }
+
+  @Test
+  void everyReportedDriverMetricIsDeclaredAsSupported() {
+    // BatchScanExec.postDriverMetrics looks each reported name up in the scan's supported metrics
+    // and fails the query when one is missing, so a name reported but not declared turns every
+    // successful distributed search into an exception.
+    LanceDistributedSearchScan scan = scanForPlanning("file:/missing-metrics-only-dataset");
+    Set<String> supported = new HashSet<>();
+    for (CustomMetric metric : scan.supportedCustomMetrics()) {
+      supported.add(metric.name());
+    }
+    CustomTaskMetric[] reported = scan.reportDriverMetrics();
+    assertEquals(2, reported.length);
+    for (CustomTaskMetric metric : reported) {
+      assertTrue(
+          supported.contains(metric.name()),
+          "driver metric '"
+              + metric.name()
+              + "' is not in supportedCustomMetrics(), BatchScanExec would throw; supported: "
+              + supported);
+    }
   }
 
   @Test
@@ -52,21 +77,24 @@ class LanceDistributedSearchScanTest {
     LanceDistributedSearchScan scan = scanForPlanning(TestUtils.TestTable1Config.datasetUri);
     scan.planInputPartitions();
     Map<String, Long> first = driverMetrics(scan);
-    assertTrue(first.getOrDefault("driverPlanningTimeNs", 0L) > 0L);
-    assertTrue(first.getOrDefault("driverIndexDiscoveryTimeNs", 0L) > 0L);
-    assertTrue(first.get("driverPlanningTimeNs") >= first.get("driverIndexDiscoveryTimeNs"));
+    assertTrue(first.getOrDefault(LanceCustomMetrics.DRIVER_PLANNING_TIME_NS, 0L) > 0L);
+    assertTrue(first.getOrDefault(LanceCustomMetrics.DRIVER_INDEX_DISCOVERY_TIME_NS, 0L) > 0L);
+    assertTrue(
+        first.get(LanceCustomMetrics.DRIVER_PLANNING_TIME_NS)
+            >= first.get(LanceCustomMetrics.DRIVER_INDEX_DISCOVERY_TIME_NS));
     scan.planInputPartitions();
     assertEquals(first, driverMetrics(scan), "cached planning and reporting must not count twice");
   }
 
   private static LanceDistributedSearchScan scanForPlanning(String uri) {
-    LanceSearchQuery query = LanceSearchQuery.builder(SearchType.VECTOR)
-        .tableId(Arrays.asList("ns", "table"))
-        .namespaceImpl("dir")
-        .readOptions(LanceSparkReadOptions.from(uri))
-        .vector(Collections.singletonList(0.0f))
-        .vectorColumn("x")
-        .build();
+    LanceSearchQuery query =
+        LanceSearchQuery.builder(SearchType.VECTOR)
+            .tableId(Arrays.asList("ns", "table"))
+            .namespaceImpl("dir")
+            .readOptions(LanceSparkReadOptions.from(uri))
+            .vector(Collections.singletonList(0.0f))
+            .vectorColumn("x")
+            .build();
     return new LanceDistributedSearchScan(new StructType(), query);
   }
 
@@ -120,7 +148,7 @@ class LanceDistributedSearchScanTest {
             .nprobes(7)
             .build();
     LanceDistributedSearchInputPartition partition =
-        LanceDistributedSearchInputPartition.forFragment(new StructType(), query, 1);
+        LanceDistributedSearchInputPartition.forFragment(new StructType(), query, 1, "test-scan");
 
     // An explicit nprobes means exactly that many probes, matching how lance maps the field on a
     // namespace query since lance#9184.
@@ -145,13 +173,14 @@ class LanceDistributedSearchScanTest {
     // nothing but flat units, which is why dropping this turns bypass into an ANN search.
     ScanOptions fallback =
         LanceDistributedSearchColumnarPartitionReader.buildScanOptions(
-            LanceDistributedSearchInputPartition.forFragment(new StructType(), query, 1));
+            LanceDistributedSearchInputPartition.forFragment(
+                new StructType(), query, 1, "test-scan"));
     assertFalse(fallback.getNearest().get().isUseIndex(), "flat unit must not use the index");
 
     ScanOptions indexed =
         LanceDistributedSearchColumnarPartitionReader.buildScanOptions(
             LanceDistributedSearchInputPartition.forIndexSegment(
-                new StructType(), query, UUID.randomUUID()));
+                new StructType(), query, UUID.randomUUID(), "test-scan"));
     assertTrue(indexed.getNearest().get().isUseIndex(), "indexed unit must use the index");
   }
 

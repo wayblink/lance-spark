@@ -183,7 +183,7 @@ Naming conventions:
 | `numIndexCacheHits` / `numIndexCacheMisses` | counters | Native index-cache lookup hits and misses reported by this scanner. These count cache lookups, not resident files or bytes. |
 | `datasetOpenTimeNs` | duration | Time spent in `Dataset.open(...)` — manifest load, namespace lookup, credential fetch. High values indicate catalog or metadata cache misses. |
 | `scannerCreateTimeNs` | duration | Time spent in `fragment.newScan(...)` — scan planning, predicate compilation, index lookup setup. |
-| `batchLoadTimeNs` | duration | Wall-clock time inside `loadNextBatch` — JNI crossing, IO, and Arrow IPC deserialization. Divide by `numBatchesLoaded` to get per-batch cost. |
+| `batchLoadTimeNs` | duration | Wall-clock time to produce one batch and hand it to Spark: JNI crossing, IO, Arrow IPC deserialization, and building the Spark column vectors. Both the table read path and the distributed search path stop the timer at that same point, so the two are comparable. Divide by `numBatchesLoaded` to get per-batch cost. |
 
 How to read these together:
 
@@ -203,7 +203,8 @@ the same metrics on its scan node, one task per index segment or uncovered fragm
 little differently than a table scan:
 
 - `batchLoadTimeNs` is the time spent producing the search results: probing the index, scanning
-  candidate codes, computing distances, and fetching the matching rows. `scannerCreateTimeNs`
+  candidate codes, computing distances, fetching the matching rows, and wrapping the returned Arrow
+  vectors as Spark columns (the same boundary the table read path uses). `scannerCreateTimeNs`
   covers `newScan` plus starting the Arrow stream, and `datasetOpenTimeNs` covers opening the
   dataset on the worker.
 - `numIops` / `numRequests` / `numBytesRead` count what the task pulled from storage. These are what
@@ -215,7 +216,11 @@ little differently than a table scan:
 - `numIndexCacheHits` / `numIndexCacheMisses` are this scanner's native index-cache lookup counts.
   A hit does not prove that a whole index file, all IVF lists, or the full table's indexes reside in
   memory. Pair the counts with bytes read, parts loaded, executor placement and the configured
-  native cache budget; the connector does not report index-residency coverage.
+  native cache budget; the connector does not report index-residency coverage. A `0 / 0` pair is
+  not a 100% miss rate: it means the cache was not consulted on this path (cache disabled, or the
+  index was reached without the cache layer) or the scanner reported no statistics at all. The
+  reader treats missing stats as diagnostics only and never fails a task over them, so check whether
+  the other counters are populated before reading a zero pair as a measurement.
 - `numRowsScanned` comes from Lance's own per-scan counter: rows read from storage, including the
   fetches that assemble the top-k rows. It measures work done rather than rows matched, and is the
   first thing to compare between two runs — if both read the same rows, a wall-clock difference is
@@ -233,7 +238,9 @@ The distributed search scan also publishes two **driver-only** durations on its 
 These are snapshots from planning, not task counters: repeated reporting or reading the cached
 partition plan does not add them again, and reading metrics never starts dataset I/O. Before planning,
 zero means not measured. The discovery duration is included in planning; do not add them together.
-Plans and driver planning logs carry a stable `scanId` to associate them with the scan's SQL execution.
+Plans, the driver planning log and the executor's per-task line (which carries `Lance distributed
+search task: scanId=...`) all share the same stable `scanId`, so a slow or failed task can be
+attributed to the scan that planned it.
 Use Spark's existing Sort, Window, Exchange and stage metrics for global merging rather than adding
 another overlapping merge timer. Summed task durations describe work across workers, not query
 wall-clock time; `batchLoadTimeNs` is not a JNI-only timer. Metrics collection does not change the

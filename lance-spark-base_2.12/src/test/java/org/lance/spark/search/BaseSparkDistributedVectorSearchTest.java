@@ -26,20 +26,24 @@ import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec;
 import org.apache.spark.sql.execution.adaptive.QueryStageExec;
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec;
+import org.apache.spark.sql.execution.metric.SQLMetric;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import scala.collection.JavaConverters;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -398,6 +402,66 @@ public abstract class BaseSparkDistributedVectorSearchTest {
     for (SparkPlan child : scala.collection.JavaConverters.seqAsJavaList(plan.children())) {
       Scan result = findSearchScanOrNull(child);
       if (result != null) return result;
+    }
+    return null;
+  }
+
+  /**
+   * The driver-only durations must actually reach the scan node. Spark's {@code
+   * BatchScanExec.postDriverMetrics} looks every reported name up in {@code metrics}, which is
+   * built from {@code supportedCustomMetrics()}, and throws on a query that otherwise succeeded
+   * when a name is missing: a mismatch here fails every distributed search, not just the metrics
+   * column.
+   */
+  @Test
+  void distributedSearchReportsDriverPlanningMetricsOnTheScanNode() {
+    String fullName = createFiveFragmentTable();
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    // The executed-plan copy of the scan node is the one that posted the metrics; AQE may plan a
+    // stage from a fresh copy, which would start at zero.
+    spark.conf().set("spark.sql.adaptive.enabled", "false");
+
+    Dataset<Row> result =
+        spark.sql("SELECT id FROM VECTOR_SEARCH('" + fullName + "', array(0.0, 0.0, 0.0, 0.0), 3)");
+    assertEquals(3, result.collectAsList().size());
+
+    Map<String, Long> driverMetrics = driverMetricsOf(result.queryExecution().executedPlan());
+    assertNotNull(driverMetrics, "no BatchScanExec with LanceDistributedSearchScan in the plan");
+    assertTrue(
+        driverMetrics.getOrDefault(LanceCustomMetrics.DRIVER_PLANNING_TIME_NS, 0L) > 0L,
+        "driverPlanningTimeNs: " + driverMetrics);
+    assertTrue(
+        driverMetrics.getOrDefault(LanceCustomMetrics.DRIVER_INDEX_DISCOVERY_TIME_NS, 0L) > 0L,
+        "driverIndexDiscoveryTimeNs: " + driverMetrics);
+  }
+
+  /**
+   * The scan node's own metric map, which is what {@code postDriverMetrics} updated, or null when
+   * the plan holds no distributed search scan.
+   */
+  private static Map<String, Long> driverMetricsOf(SparkPlan plan) {
+    if (plan instanceof AdaptiveSparkPlanExec) {
+      return driverMetricsOf(((AdaptiveSparkPlanExec) plan).executedPlan());
+    }
+    if (plan instanceof QueryStageExec) {
+      return driverMetricsOf(((QueryStageExec) plan).plan());
+    }
+    if (plan instanceof BatchScanExec) {
+      BatchScanExec exec = (BatchScanExec) plan;
+      if (exec.scan() instanceof LanceDistributedSearchScan) {
+        Map<String, Long> values = new HashMap<>();
+        for (Map.Entry<String, SQLMetric> metric :
+            JavaConverters.mapAsJavaMap(exec.metrics()).entrySet()) {
+          values.put(metric.getKey(), metric.getValue().value());
+        }
+        return values;
+      }
+    }
+    for (SparkPlan child : JavaConverters.seqAsJavaList(plan.children())) {
+      Map<String, Long> found = driverMetricsOf(child);
+      if (found != null) {
+        return found;
+      }
     }
     return null;
   }

@@ -209,27 +209,27 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
       Optional<VectorIndexInfo> vectorIndex;
       try {
         namedIndex =
-          requestedIndex != null
-              ? resolveNamedVectorIndex(dataset, requestedIndex, query.getVectorColumn())
-              : null;
-      // A named index decides the column, even when the search bypasses the index: the caller
-      // named an index, so the column it was built on is the one they mean.
-      column = namedIndex != null ? namedIndex.column : resolveVectorColumn();
-      if (namedIndex != null && bypassVectorIndex) {
-        // bypass_vector_index means "do not search an index"; naming one is not a conflict worth
-        // failing on, but it must not look as if the named index was used.
-        LOG.warn("Ignoring index {} because bypass_vector_index=true", requestedIndex);
-      }
-      vectorIndex =
-          bypassVectorIndex
-              ? Optional.empty()
-              : selectVectorIndex(
-                  dataset,
-                  column,
-                  query.getDistanceType(),
-                  fastSearch,
-                  namedIndex == null ? null : namedIndex.description,
-                  namedIndex == null ? null : namedIndex.allIndices);
+            requestedIndex != null
+                ? resolveNamedVectorIndex(dataset, requestedIndex, query.getVectorColumn())
+                : null;
+        // A named index decides the column, even when the search bypasses the index: the caller
+        // named an index, so the column it was built on is the one they mean.
+        column = namedIndex != null ? namedIndex.column : resolveVectorColumn();
+        if (namedIndex != null && bypassVectorIndex) {
+          // bypass_vector_index means "do not search an index"; naming one is not a conflict worth
+          // failing on, but it must not look as if the named index was used.
+          LOG.warn("Ignoring index {} because bypass_vector_index=true", requestedIndex);
+        }
+        vectorIndex =
+            bypassVectorIndex
+                ? Optional.empty()
+                : selectVectorIndex(
+                    dataset,
+                    column,
+                    query.getDistanceType(),
+                    fastSearch,
+                    namedIndex == null ? null : namedIndex.description,
+                    namedIndex == null ? null : namedIndex.allIndices);
       } finally {
         driverIndexDiscoveryTimeNs = System.nanoTime() - discoveryStart;
       }
@@ -315,11 +315,13 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
     List<LanceDistributedSearchInputPartition> units = new ArrayList<>();
     for (UUID segmentUuid : liveSegments) {
       units.add(
-          LanceDistributedSearchInputPartition.forIndexSegment(schema, indexedQuery, segmentUuid));
+          LanceDistributedSearchInputPartition.forIndexSegment(
+              schema, indexedQuery, segmentUuid, scanId));
     }
     for (Integer fragmentId : fallbackFragments) {
       units.add(
-          LanceDistributedSearchInputPartition.forFragment(schema, fallbackQuery, fragmentId));
+          LanceDistributedSearchInputPartition.forFragment(
+              schema, fallbackQuery, fragmentId, scanId));
     }
     return units;
   }

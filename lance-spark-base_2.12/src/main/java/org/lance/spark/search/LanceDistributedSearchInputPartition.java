@@ -34,32 +34,42 @@ public class LanceDistributedSearchInputPartition implements InputPartition {
   private final List<Integer> fragmentIds;
   private final List<UUID> indexSegments;
 
+  /**
+   * The planning scan's tracing id, carried along so an executor log line can be tied back to the
+   * driver's planning log for the same scan. It is not part of the unit's identity: units of one
+   * scan share it, and it never affects which rows the task returns.
+   */
+  private final String scanId;
+
   private LanceDistributedSearchInputPartition(
       StructType schema,
       LanceSearchQuery query,
       List<Integer> fragmentIds,
-      List<UUID> indexSegments) {
+      List<UUID> indexSegments,
+      String scanId) {
     this.schema = schema;
     this.query = query;
     this.fragmentIds = fragmentIds;
     this.indexSegments = indexSegments;
+    this.scanId = scanId;
   }
 
   /** An indexed unit: search one segment of a vector index through {@code indexSegments(...)}. */
   public static LanceDistributedSearchInputPartition forIndexSegment(
-      StructType schema, LanceSearchQuery query, UUID segmentUuid) {
+      StructType schema, LanceSearchQuery query, UUID segmentUuid, String scanId) {
     return new LanceDistributedSearchInputPartition(
         schema,
         query,
         Collections.emptyList(),
-        Collections.singletonList(Objects.requireNonNull(segmentUuid, "segmentUuid")));
+        Collections.singletonList(Objects.requireNonNull(segmentUuid, "segmentUuid")),
+        scanId);
   }
 
   /** A fallback unit: flat KNN over one fragment no index segment covers. */
   public static LanceDistributedSearchInputPartition forFragment(
-      StructType schema, LanceSearchQuery query, int fragmentId) {
+      StructType schema, LanceSearchQuery query, int fragmentId, String scanId) {
     return new LanceDistributedSearchInputPartition(
-        schema, query, Collections.singletonList(fragmentId), Collections.emptyList());
+        schema, query, Collections.singletonList(fragmentId), Collections.emptyList(), scanId);
   }
 
   public StructType getSchema() {
@@ -76,5 +86,10 @@ public class LanceDistributedSearchInputPartition implements InputPartition {
 
   public List<UUID> getIndexSegments() {
     return indexSegments;
+  }
+
+  /** The planning scan's tracing id, for correlating executor logs with the driver's. */
+  public String getScanId() {
+    return scanId;
   }
 }

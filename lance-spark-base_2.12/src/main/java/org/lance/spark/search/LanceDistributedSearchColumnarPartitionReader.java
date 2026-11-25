@@ -30,6 +30,8 @@ import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.List;
@@ -61,6 +63,9 @@ public class LanceDistributedSearchColumnarPartitionReader
    */
   private static final String STAT_ROWS_SCANNED = "rows_scanned";
 
+  private static final Logger LOG =
+      LoggerFactory.getLogger(LanceDistributedSearchColumnarPartitionReader.class);
+
   private final LanceDistributedSearchInputPartition partition;
   private final LanceReadMetricsTracker metricsTracker = new LanceReadMetricsTracker();
   private ExecutorNamespace executorNamespace;
@@ -87,11 +92,16 @@ public class LanceDistributedSearchColumnarPartitionReader
     long batchStart = System.nanoTime();
     boolean hasNext = reader.loadNextBatch();
     if (hasNext) {
-      metricsTracker.addBatchLoadTimeNs(System.nanoTime() - batchStart);
-      metricsTracker.addNumBatchesLoaded(1);
       currentBatch =
           LanceSearchColumnarPartitionReader.toColumnarBatch(
               reader.getVectorSchemaRoot(), partition.getSchema());
+      // Stopped once the Spark columns exist, not right after loadNextBatch: the read path
+      // measures all of LanceFragmentColumnarBatchScanner.loadNextBatch, which includes building
+      // the column vectors. Wrapping the Arrow vectors is cheap but not free, and stopping earlier
+      // would make this metric systematically smaller than the read path's while the docs describe
+      // both as the batch-production time.
+      metricsTracker.addBatchLoadTimeNs(System.nanoTime() - batchStart);
+      metricsTracker.addNumBatchesLoaded(1);
       return true;
     }
     // Spark samples the reader's metrics before it calls close() (DataSourceRDD's task-completion
@@ -190,8 +200,21 @@ public class LanceDistributedSearchColumnarPartitionReader
       metricsTracker.addScannerCreateTimeNs(System.nanoTime() - scanStart);
     } catch (Exception e) {
       throw new IOException(
-          "Failed to open distributed search scan for partition: " + describe(partition), e);
+          "Failed to open distributed search scan for scanId="
+              + partition.getScanId()
+              + ", partition: "
+              + describe(partition),
+          e);
     }
+    // One line per task, so an executor-side log can be matched to the driver's planning line for
+    // the same scan (both carry scanId) instead of guessing by timing or by fragment numbers.
+    LOG.info(
+        "Lance distributed search task: scanId={}, unit={}, datasetOpenTimeNs={}, "
+            + "scannerCreateTimeNs={}",
+        partition.getScanId(),
+        describe(partition),
+        metricsTracker.getDatasetOpenTimeNs(),
+        metricsTracker.getScannerCreateTimeNs());
   }
 
   static ScanOptions buildScanOptions(LanceDistributedSearchInputPartition p) {

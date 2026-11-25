@@ -285,9 +285,10 @@ keeps a reused namespace client from serving past its credentials' lifetime.
 
 What the lease deliberately does not do: it never reuses across versions, credentials or namespace
 roots, and it does not lease "latest" — only a reference that pins a concrete version, which is what
-the planner hands each task. A read whose options say "latest" (the deferred payload fetch, as it
-runs today) opens per consumer exactly as before, so the mechanism can be turned off without
-changing a single row of the answer.
+the planner hands each task. A read whose options say "latest" opens per consumer exactly as before.
+The deferred payload fetch sits on the planner's pin too, so a fetch that lands on an executor still
+holding the search task's lease for that version reuses it; turning the lease off changes
+performance only, never the answer.
 
 ### Custom Write Metrics
 

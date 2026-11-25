@@ -228,11 +228,13 @@ query re-plans from the cache without re-reading anything.
 
 The lease saves nothing when every task already runs on its own executor JVM (one task per
 executor), when each task's search dominates its open cost, or when the credentials change on every
-query. It also does not help a search whose read options carry no pinned version, such as the
-deferred payload fetch as it runs today. The planning cache helps repeated queries against one
-version and does nothing for a table that commits between queries, since each version is planned
-once. Turning both off changes performance only: results, recall, the ranking contract and the pin
-semantics are identical.
+query. It also does not help a read whose options carry no pinned version, because only a pinned
+reference is leased: "latest" or a moving tag would let a reuse answer from an older snapshot. The
+distributed search always pins, and the deferred payload fetch now carries the same pin, so both can
+reuse a leased dataset. The planning cache helps repeated queries against one version and does
+nothing for a table that commits between queries, since each version is planned once. Turning both
+off changes performance only: results, recall, the ranking contract and the pin semantics are
+identical.
 
 ## Cache Backends
 

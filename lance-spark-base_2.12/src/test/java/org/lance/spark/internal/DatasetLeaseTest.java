@@ -15,6 +15,7 @@ package org.lance.spark.internal;
 
 import org.lance.spark.LanceRef;
 import org.lance.spark.LanceSparkReadOptions;
+import org.lance.spark.search.LanceFetchPayloadSource;
 
 import org.junit.jupiter.api.Test;
 
@@ -103,6 +104,34 @@ class DatasetLeaseTest {
     LeaseRegistry.Key main = key(options().ref(LanceRef.ofMain(7)).build(), null);
     LeaseRegistry.Key branch = key(options().ref(LanceRef.ofBranch("dev", 7)).build(), null);
     assertNotEquals(main, branch, "the same version on another branch is another snapshot");
+  }
+
+  /**
+   * The deferred payload fetch runs in a second job and reopens the dataset; it can only reuse the
+   * search task's open if the key it derives is the same. That depends on the exec passing the
+   * scan's pinned options into the source: the planner-time options carry no version and are never
+   * leased.
+   */
+  @Test
+  void thePayloadFetchUsesTheSearchTasksPinnedKey() {
+    Map<String, String> initial = Collections.singletonMap("aws_session_token", "token");
+    Map<String, String> namespace = Collections.singletonMap("root", "/tmp");
+    LanceFetchPayloadSource source =
+        new LanceFetchPayloadSource(
+            options().ref(null).build(),
+            initial,
+            "dir",
+            namespace,
+            DatasetLeaseSettings.defaults());
+    assertNull(
+        DatasetLease.keyOf(source.readOptions(), initial, "dir", namespace),
+        "the planning options carry no version, so an unpinned fetch must not lease");
+
+    LanceSparkReadOptions pinned = options().ref(LanceRef.ofMain(7)).build();
+    assertEquals(
+        DatasetLease.keyOf(pinned, initial, "dir", namespace),
+        DatasetLease.keyOf(source.withReadOptions(pinned).readOptions(), initial, "dir", namespace),
+        "a fetch handed the scan's pin must land on the search task's lease key");
   }
 
   @Test

@@ -34,6 +34,19 @@ class LanceFetchPayloadSource(
     val leaseSettings: DatasetLeaseSettings)
   extends Serializable {
 
+  /**
+   * The same holder with different read options, used to hand the fetch the version the scan
+   * pinned. Everything else - the driver-side credentials, the namespace identity, the lease
+   * settings - is unchanged because only the snapshot of the same dataset changes.
+   */
+  def withReadOptions(readOptions: LanceSparkReadOptions): LanceFetchPayloadSource =
+    new LanceFetchPayloadSource(
+      readOptions,
+      initialStorageOptions,
+      namespaceImpl,
+      namespaceProperties,
+      leaseSettings)
+
   /** Deliberately opaque: storage options are credentials and must not enter a plan string. */
   override def toString: String = "LanceFetchPayloadSource(credentials=redacted)"
 }

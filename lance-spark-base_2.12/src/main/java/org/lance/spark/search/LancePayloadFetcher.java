@@ -14,6 +14,8 @@
 package org.lance.spark.search;
 
 import org.lance.Dataset;
+import org.lance.spark.LanceRef;
+import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.internal.DatasetLease;
 import org.lance.spark.vectorized.LanceArrowColumnVector;
 
@@ -49,6 +51,10 @@ import java.util.NoSuchElementException;
  * this fetch materializes the payload for the winners only, through {@code Dataset.takeRows} on the
  * same pinned snapshot. Deferring the payload drops the per-unit copies of it, at the cost of one
  * extra random-access read.
+ *
+ * <p>The read options in the source must pin a dataset version: the fetch reopens the dataset, and
+ * an unpinned open would resolve "latest" while the ranking read the scan's snapshot. {@link
+ * #fetch} refuses an unpinned source instead of risking a mix of two versions.
  *
  * <p>Row ids are never matched to rows by array position. lance-core returns the requested rows in
  * the requested order, duplicates included, but it <em>silently drops</em> a row id that is not in
@@ -229,6 +235,8 @@ public final class LancePayloadFetcher implements Serializable {
       // opening the dataset again would only add an unnecessary snapshot read.
       return narrowOnly(rowIds, distances, queryIndexes);
     }
+
+    requirePinnedVersion(source.readOptions());
 
     final DatasetLease.Handle lease;
     final Dataset dataset;
@@ -478,6 +486,22 @@ public final class LancePayloadFetcher implements Serializable {
         }
       }
     };
+  }
+
+  /**
+   * Fails unless {@code readOptions} pin a concrete main or branch version. The fetch reopens the
+   * dataset: an unpinned ref would read "latest", and a tag is resolved as a checkout of wherever
+   * the tag points - a moving target - so neither is the snapshot the ranking used.
+   */
+  private static void requirePinnedVersion(LanceSparkReadOptions readOptions) {
+    LanceRef ref = readOptions.getRef();
+    if (ref != null && !ref.isTag() && ref.getVersionNumber().isPresent()) {
+      return;
+    }
+    throw new IllegalStateException(
+        "Refusing to read the deferred search payload from the latest dataset version: the fetch "
+            + "was not given the version the search planned on, which could mix two snapshots. "
+            + "Disable spark.sql.lance.search.payload.deferral.mode to use the fused plan.");
   }
 
   private boolean isNarrow(String name) {

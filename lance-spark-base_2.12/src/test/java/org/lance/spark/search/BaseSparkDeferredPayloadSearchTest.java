@@ -13,14 +13,20 @@
  */
 package org.lance.spark.search;
 
+import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.execution.datasources.v2.LanceFetchPayloadExec;
+import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import scala.reflect.ClassTag;
+import scala.reflect.ClassTag$;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -207,6 +213,208 @@ public abstract class BaseSparkDeferredPayloadSearchTest {
     for (Row row : deferred) {
       assertTrue(row.getInt(0) != 1, "the deleted row must not come back");
     }
+  }
+
+  /**
+   * The deferred fetch must read the snapshot the search planned on, not whatever is latest when
+   * the payload is fetched.
+   *
+   * <p>The fetch node is executed twice here on purpose. Its first call plans the scan's
+   * partitions, which is where the search pins the dataset version; the second call reuses those
+   * partitions (a planned partition list is fixed) and is the state a retried fetch or a second
+   * action runs in. Deleting a winner in between makes a latest read silently drop its row id, so
+   * the fetch fails - the search answered from one version and the payload read another. The
+   * renamed payload is not used because a delete keeps row addresses valid (a deletion vector),
+   * which is exactly the case the row-id verification cannot see as "a row of the wrong snapshot".
+   */
+  @Test
+  void theFetchReadsTheVersionTheSearchPinned() {
+    assumeNamedArguments();
+    String table = createTable("pinned_fetch", 4);
+    String sql =
+        "SELECT id, name, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_vector => array(0.0, 0.0, 0.0, 0.0), k => 6, "
+            + "columns => array('id', 'name')) ORDER BY _distance, id";
+
+    spark.conf().set("spark.sql.adaptive.enabled", "false");
+    spark.conf().set(MODE_CONF, "force");
+    try {
+      Dataset<Row> deferred = spark.sql(sql);
+      LanceFetchPayloadExec fetch = fetchPayloadExec(deferred);
+
+      List<String> before = payloadNames(fetch);
+      assertEquals(
+          java.util.Arrays.asList("n0", "n1", "n2", "n3", "n4", "n5"),
+          before,
+          "the first fetch reads the version the search planned on");
+
+      // A new version with one winner deleted: its row id survives in the fragment (a deletion
+      // vector, not a rewrite), and takeRows silently drops it, so a fetch at latest returns fewer
+      // rows than it asked for instead of attaching the wrong payload.
+      spark.sql("DELETE FROM " + table + " WHERE id = 5");
+      assertEquals(
+          0,
+          spark.sql("SELECT id FROM " + table + " WHERE id = 5").collectAsList().size(),
+          "the fixture must have committed a newer version without id 5");
+
+      List<String> after = payloadNames(fetch);
+      assertEquals(
+          before, after, "the fetch read the latest version instead of the pinned snapshot");
+    } finally {
+      spark.conf().unset("spark.sql.adaptive.enabled");
+      spark.conf().unset(MODE_CONF);
+    }
+  }
+
+  /**
+   * A pin that does not carry a version must fail the fetch instead of silently reading latest: the
+   * scan is the only place that knows which snapshot the ranking used, so a fetch it could not pin
+   * has no safe version to read. The message has to say that, or the failure looks like a storage
+   * or plumbing error.
+   */
+  @Test
+  void anUnpinnedFetchRefusesToReadTheLatestVersion() {
+    assumeNamedArguments();
+    String table = createTable("unpinned_fetch", 2);
+    String sql =
+        "SELECT id, name, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_vector => array(0.0, 0.0, 0.0, 0.0), k => 2, "
+            + "columns => array('id', 'name')) ORDER BY _distance, id";
+
+    spark.conf().set("spark.sql.adaptive.enabled", "false");
+    spark.conf().set(MODE_CONF, "force");
+    try {
+      LanceFetchPayloadExec fetch = fetchPayloadExec(spark.sql(sql));
+      // What a scan that failed to pin would record: the plumbing's options, no version.
+      assertTrue(
+          fetch.source().readOptions().getRef() == null
+              || fetch.source().readOptions().getRef().getVersionNumber().isEmpty(),
+          "the planner source must start unpinned for this test to mean anything");
+      LanceSearchVersionPin unpinned = new LanceSearchVersionPin();
+      unpinned.record(fetch.source().readOptions());
+
+      Exception error = assertThrows(Exception.class, () -> payloadNames(withPin(fetch, unpinned)));
+      assertTrue(
+          rootMessage(error).contains("Refusing to read the deferred search payload"),
+          rootMessage(error));
+    } finally {
+      spark.conf().unset("spark.sql.adaptive.enabled");
+      spark.conf().unset(MODE_CONF);
+    }
+  }
+
+  /**
+   * A tag is not a pinned snapshot: the dataset open resolves it as a checkout of the tag's current
+   * target, which can move between the ranking and the fetch. The guard must refuse it even though
+   * a version number is present on the ref.
+   */
+  @Test
+  void aMovingTagRefIsNotAPinnedSnapshotForTheFetch() {
+    assumeNamedArguments();
+    String table = createTable("tagged_fetch", 2);
+    String sql =
+        "SELECT id, name, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', query_vector => array(0.0, 0.0, 0.0, 0.0), k => 2, "
+            + "columns => array('id', 'name')) ORDER BY _distance, id";
+
+    spark.conf().set("spark.sql.adaptive.enabled", "false");
+    spark.conf().set(MODE_CONF, "force");
+    try {
+      LanceFetchPayloadExec fetch = fetchPayloadExec(spark.sql(sql));
+      LanceSearchVersionPin tagged = new LanceSearchVersionPin();
+      tagged.record(
+          fetch
+              .source()
+              .readOptions()
+              .withRef(
+                  new org.lance.spark.LanceRef(
+                      org.lance.spark.utils.Optional.of(1L),
+                      org.lance.spark.utils.Optional.<String>empty(),
+                      org.lance.spark.utils.Optional.of("release"))));
+
+      Exception error = assertThrows(Exception.class, () -> payloadNames(withPin(fetch, tagged)));
+      assertTrue(
+          rootMessage(error).contains("Refusing to read the deferred search payload"),
+          rootMessage(error));
+    } finally {
+      spark.conf().unset("spark.sql.adaptive.enabled");
+      spark.conf().unset(MODE_CONF);
+    }
+  }
+
+  /** The same fetch node with a different pin, so a test can hand it a pin the scan would not. */
+  private LanceFetchPayloadExec withPin(LanceFetchPayloadExec fetch, LanceSearchVersionPin pin) {
+    return new LanceFetchPayloadExec(
+        fetch.child(),
+        fetch.columns(),
+        fetch.fetched(),
+        fetch.narrowColumns(),
+        fetch.isBatch(),
+        fetch.source(),
+        fetch.chunkRows(),
+        pin);
+  }
+
+  /**
+   * The fetch reads the payload column of every winner from the fetch node's own batches. It walks
+   * the physical plan to the node, because the fetch is the second phase and its RDD is only built
+   * when the plan runs; executing that node directly skips Spark's shuffle reuse and re-runs the
+   * fetch, which is exactly the path this test needs.
+   */
+  private LanceFetchPayloadExec fetchPayloadExec(Dataset<Row> query) {
+    org.apache.spark.sql.execution.SparkPlan root = query.queryExecution().executedPlan();
+    java.util.ArrayDeque<org.apache.spark.sql.execution.SparkPlan> pending =
+        new java.util.ArrayDeque<>();
+    pending.push(root);
+    LanceFetchPayloadExec found = null;
+    while (!pending.isEmpty()) {
+      org.apache.spark.sql.execution.SparkPlan plan = pending.pop();
+      if (plan instanceof LanceFetchPayloadExec) {
+        found = (LanceFetchPayloadExec) plan;
+      }
+      scala.collection.Iterator<org.apache.spark.sql.execution.SparkPlan> children =
+          plan.children().iterator();
+      while (children.hasNext()) {
+        pending.push(children.next());
+      }
+    }
+    assertTrue(found != null, "the forced plan must contain a LanceFetchPayload node: " + root);
+    return found;
+  }
+
+  private static List<String> payloadNames(LanceFetchPayloadExec fetch) {
+    List<String> output = new ArrayList<>();
+    for (org.apache.spark.sql.catalyst.expressions.Attribute column :
+        scala.collection.JavaConverters.seqAsJavaList(fetch.columns())) {
+      output.add(column.name());
+    }
+    int namePosition = output.indexOf("name");
+    assertTrue(namePosition >= 0, "the fetch output must carry the payload column: " + output);
+
+    // A dataset action calls resetMetrics() on the plan before executing it, which materializes the
+    // SQL metrics on the driver. This direct execution has to do that too: the metric callback runs
+    // on the executor, where the serialized plan's transient session is null, so letting the lazy
+    // value initialize there would throw.
+    fetch.resetMetrics();
+
+    // The fetch RDD is columnar, and Spark's plan-level collect path only handles UnsafeRows;
+    // flattening the batches to strings first keeps every task result serializable.
+    ClassTag<ColumnarBatch> tag = ClassTag$.MODULE$.apply(ColumnarBatch.class);
+    JavaRDD<ColumnarBatch> batches = JavaRDD.fromRDD(fetch.executeColumnar(), tag);
+    return batches
+        .flatMap(
+            batch -> {
+              List<String> names = new ArrayList<>();
+              java.util.Iterator<InternalRow> rows = batch.rowIterator();
+              while (rows.hasNext()) {
+                names.add(rows.next().getString(namePosition));
+              }
+              return names.iterator();
+            })
+        .collect();
   }
 
   @Test

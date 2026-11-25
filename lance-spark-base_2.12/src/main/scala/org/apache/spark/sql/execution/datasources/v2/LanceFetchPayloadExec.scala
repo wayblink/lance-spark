@@ -161,10 +161,14 @@ case class LanceFetchPayloadExec(
           "which could mix two snapshots. Disable " +
           "spark.sql.lance.search.payload.deferral.mode to use the fused plan.")
     }
+    // The source was built while planning, when no version was known yet, so opening it as-is
+    // would read latest. Handing the fetcher a copy with the pinned ref is what puts the payload
+    // read on the same snapshot the ranking saw; the fetcher itself refuses an unpinned source.
+    val pinnedSource = source.withReadOptions(pinned)
     val schema = StructType(columns.map(a => StructField(a.name, a.dataType, a.nullable)))
     val fetcher =
       new LancePayloadFetcher(
-        source,
+        pinnedSource,
         schema,
         fetched.map(_.name).asJava,
         narrow.asJava,

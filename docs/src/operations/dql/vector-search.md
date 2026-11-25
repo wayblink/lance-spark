@@ -309,10 +309,11 @@ columns by name; `auto` falls back to the fused plan.
 
 The fetch opens the dataset the way the search tasks do, including the executor-side namespace
 credential refresh, so a long fetch does not run on a token that expired during the first phase. It
-verifies every returned `_rowid` against the requested one and fails the task on a mismatch, because
-lance-core silently drops a row id that is not in the snapshot and a positional mapping would attach
-payload to the wrong row. A retried fetch task re-reads its chunk from the pinned snapshot, so it
-returns the same rows. The plan shows `LanceFetchPayload([columns], narrow=[...], batch=...,
+reopens the dataset at the version the scan pinned, never at `latest`: a fetch that is not handed a
+pinned version fails instead of risking payload from a newer snapshot. It verifies every returned
+`_rowid` against the requested one and fails the task on a mismatch, because lance-core silently
+drops a row id that is not in the snapshot and a positional mapping would attach payload to the wrong
+row. A retried fetch task re-reads its chunk from the pinned snapshot, so it returns the same rows. The plan shows `LanceFetchPayload([columns], narrow=[...], batch=...,
 chunkRows=...)`, which makes the choice visible in `EXPLAIN`; credentials are kept out of that text.
 The node does not publish an ordering, so an outer `ORDER BY` still sorts.
 

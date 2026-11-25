@@ -136,6 +136,18 @@ class ResultsTests(unittest.TestCase):
             qs[0]["vector"][0] = 0.2;q.write_text("\n".join(json.dumps(x) for x in qs))
             with self.assertRaises(ValueError): baseline.validate_asset_files(cfg, q, t)
 
+    def test_prepared_matrix_has_one_true_batch_statement_and_safe_evidence(self):
+        import benchmark
+        import pilot
+        cfg = contract(); plans = benchmark.matrix(cfg, "contract.json", "queries.parquet", "truth.json", "hdfs://run")
+        self.assertEqual(len(plans), 5)
+        self.assertEqual([p["samples"] for p in plans], [30, 30, 30, 3, 3])
+        self.assertEqual(len({p["arguments"][3] for p in plans}), 5)
+        pod = {"spec": {"containers": [{"env": [{"name": "AWS_SECRET_ACCESS_KEY", "value": "raw-secret"}],
+                                            "args": ["spark.sql.catalog.lance.storage.access_key_id=raw-key"]}]}}
+        self.assertNotIn("raw-secret", json.dumps(pilot.redact_json(pod)))
+        self.assertNotIn("raw-key", json.dumps(pilot.redact_json(pod)))
+
     def test_window_ignores_terminal_and_uses_uid_not_name(self):
         own = {"uid": "ours", "name": "mine", "phase": "Running", "role": "executor"}
         old = {"uid": "old", "name": "same", "phase": "Succeeded", "role": "executor"}

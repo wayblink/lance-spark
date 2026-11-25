@@ -39,13 +39,27 @@ def redact(text, secrets=()):
     return text
 
 
+def redact_json(value):
+    """Remove credentials from pod env/command snapshots before evidence leaves the host."""
+    if isinstance(value, dict):
+        if value.get("name") and any(x in str(value["name"]).lower() for x in ("secret", "access_key", "credential", "token")) and "value" in value:
+            value = {**value, "value": "<redacted>"}
+        return {k:("<redacted>" if any(x in k.lower() for x in ("secret_access_key", "access_key_id", "credential", "password")) else redact_json(v)) for k,v in value.items()}
+    if isinstance(value, list):
+        return [redact_json(x) for x in value]
+    if isinstance(value, str):
+        import re
+        return re.sub(r"((?:access_key_id|secret_access_key|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY)[= ]+)[^ ,\\\"]+", r"\1<redacted>", value)
+    return value
+
+
 def record_pods_and_events(output, ns, run_id, uid, secrets):
     pods = kube(["get", "pods", "-n", ns, "-o", "json"])
     if pods.returncode == 0:
         items = json.loads(pods.stdout).get("items", [])
         related = [p for p in items if p["metadata"]["name"] == run_id or
                    any(o.get("uid") == uid for o in p["metadata"].get("ownerReferences", []))]
-        (output / "pods-after.json").write_text(redact(json.dumps(related, indent=2), secrets))
+        (output / "pods-after.json").write_text(redact(json.dumps(redact_json(related), indent=2), secrets))
     if uid:
         events = kube(["get", "events", "-n", ns, "--field-selector", "involvedObject.uid="+uid, "-o", "json"])
         (output / "kube-events.json").write_text(redact(events.stdout+events.stderr, secrets))
@@ -60,6 +74,7 @@ def main():
     a = p.parse_args()
     if not a.approved:
         p.error("pilot requires explicit --approved after lead authorization")
+    os.umask(0o077)
     c = json.loads(a.contract.read_text()); baseline.validate_contract(c)
     a.output.mkdir(parents=True, exist_ok=False)
     runid = "b3255-pilot-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
@@ -71,7 +86,8 @@ def main():
     existing, ok = get_pod(ns, podname)
     baseline.require(ok and existing is None, "refuse existing pod or unavailable API")
     snapshot = kube(["get", "pods", "-n", ns, "-o", "json"])
-    (a.output / "pods-before.json").write_text(snapshot.stdout)
+    if snapshot.returncode == 0:
+        (a.output / "pods-before.json").write_text(json.dumps(redact_json(json.loads(snapshot.stdout)), indent=2))
     baseline.require(snapshot.returncode == 0, "cannot record initial cluster snapshot")
     source = HERE / "BaselinePilot.java"
     build = a.output / "build"; build.mkdir(); (build / "classes").mkdir()
@@ -137,7 +153,7 @@ def main():
                 pod,api_ok=get_pod(ns,podname);state=baseline.pod_state(pod,api_ok)
                 if pod:
                     baseline.require(pod["metadata"]["uid"]==uid,"pod name was reused; do not act on replacement")
-                    (a.output/"pod-latest.json").write_text(json.dumps(pod,indent=2))
+                    (a.output/"pod-latest.json").write_text(json.dumps(redact_json(pod),indent=2))
                 if state in ["SUCCEEDED","FAILED","POD_GONE"]:break
                 # kubectl watch, not a fast busy loop; reconcile after a bounded watch interval.
                 if watch_handle.poll() is not None:
@@ -161,6 +177,9 @@ def main():
             watch_handle.terminate()
             try:watch_handle.wait(timeout=5)
             except subprocess.TimeoutExpired:watch_handle.kill();watch_handle.wait()
+        watch_path = a.output/"pod-watch.jsonl"
+        if watch_path.exists():
+            watch_path.write_text(redact(watch_path.read_text(), secrets))
         logs=kube(["logs","-n",ns,podname],timeout=30)
         (a.output/"driver.log").write_text(redact(logs.stdout+logs.stderr, secrets))
         describe=kube(["describe","pod","-n",ns,podname])

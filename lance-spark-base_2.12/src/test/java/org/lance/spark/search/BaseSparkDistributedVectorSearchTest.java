@@ -26,6 +26,7 @@ import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec;
 import org.apache.spark.sql.execution.adaptive.QueryStageExec;
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec;
+import org.apache.spark.sql.execution.datasources.v2.LanceBatchTopKExec;
 import org.apache.spark.sql.execution.metric.SQLMetric;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
@@ -37,12 +38,16 @@ import scala.collection.JavaConverters;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -734,6 +739,263 @@ public abstract class BaseSparkDistributedVectorSearchTest {
     } finally {
       spark.conf().set("spark.sql.lance.search.batch.chunk.bytes", "67108864");
     }
+  }
+
+  // ------------------------------------------------- the bounded per-query merge
+
+  /**
+   * A batch is ranked by one bounded merge per query, not by a window: `row_number()` plus a rank
+   * filter is only bounded by Spark below `spark.sql.optimizer.windowGroupLimitThreshold` (1000 in
+   * Spark 3.5), so above that the window plan sorts and materializes every candidate. The switch
+   * keeps that plan reachable for an A/B on a cluster.
+   */
+  @Test
+  void batchRankingIsABoundedMergeAndNotAWindow() {
+    assumeNamedArguments();
+    String table = createFiveFragmentTable();
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    String sql =
+        "SELECT query_id, id FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', queries => array('0.0,0.0,0.0,0.0', '2.0,2.0,2.0,2.0'), k => 2)";
+    try {
+      Dataset<Row> bounded = spark.sql(sql);
+      assertEquals(4, bounded.collectAsList().size(), "two queries times k");
+      List<String> nodes = operatorNamesOf(bounded.queryExecution().executedPlan());
+      assertTrue(nodes.contains("LanceBatchTopKExec"), "the batch must be merged, plan: " + nodes);
+      assertFalse(nodes.contains("WindowExec"), "no window over the candidates, plan: " + nodes);
+      assertFalse(nodes.contains("WindowGroupLimitExec"), "no window group limit, plan: " + nodes);
+      assertFalse(nodes.contains("SortExec"), "the merge must not sort, plan: " + nodes);
+
+      spark.conf().set("spark.sql.lance.search.batch.merge.mode", "spark");
+      Dataset<Row> window = spark.sql(sql);
+      assertEquals(4, window.collectAsList().size(), "the switch must not change the answer");
+      List<String> windowNodes = operatorNamesOf(window.queryExecution().executedPlan());
+      assertTrue(
+          windowNodes.contains("WindowExec"),
+          "merge.mode=spark must restore the window plan, plan: " + windowNodes);
+      assertFalse(
+          windowNodes.contains("LanceBatchTopKExec"),
+          "merge.mode=spark must not merge, plan: " + windowNodes);
+    } finally {
+      spark.conf().set("spark.sql.lance.search.batch.merge.mode", "bounded");
+    }
+  }
+
+  /**
+   * The merge state is the answer, not the candidates. Five units return one row per query each, so
+   * ten rows reach the merge for two queries at k = 1, and it retains two: the bound is `k` rows
+   * per query, not `units x queries x k`.
+   */
+  @Test
+  void theMergeRetainsKPerQueryAndDropsEveryOtherCandidate() {
+    assumeNamedArguments();
+    String table = createFiveFragmentTable();
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    // Without AQE the executed plan is the plan that ran, so the node's counters are the whole run.
+    spark.conf().set("spark.sql.adaptive.enabled", "false");
+    Dataset<Row> result =
+        spark.sql(
+            "SELECT query_id, id FROM VECTOR_SEARCH(table => '"
+                + table
+                + "', queries => array('0.0,0.0,0.0,0.0', '4.0,4.0,4.0,4.0'), k => 1)");
+    assertEquals(2, result.collectAsList().size(), "one row per query");
+
+    Map<String, Long> metrics = mergeMetricsOf(result.queryExecution().executedPlan());
+    assertNotNull(metrics, "the merged ranking node must publish its counters");
+    assertEquals(
+        Long.valueOf(10L),
+        metrics.get("numInputRows"),
+        "five units times two queries times one row reaches the merge, got " + metrics);
+    assertEquals(
+        Long.valueOf(2L),
+        metrics.get("numRetainedRows"),
+        "the merge keeps one row per query, got " + metrics);
+    assertEquals(
+        Long.valueOf(2L),
+        metrics.get("numDistinctQueries"),
+        "both queries were ranked in this merge, got " + metrics);
+  }
+
+  /**
+   * A query whose whole top k falls inside one search unit must keep all of it. The winners here
+   * are the four rows of the first insert, which the write put in a single fragment: their row ids
+   * are consecutive, so the merge really did see k winners from one unit and still returned them.
+   */
+  @Test
+  void aQueryWhoseTopKAllSitsInOneUnitKeepsAllOfIt() {
+    assumeNamedArguments();
+    String table = CATALOG_NAME + ".default.one_unit";
+    spark.sql(
+        "CREATE TABLE "
+            + table
+            + " (id INT NOT NULL, vector ARRAY<FLOAT> NOT NULL) USING lance "
+            + "TBLPROPERTIES ('vector.arrow.fixed-size-list.size' = '4')");
+    // Two inserts, one fragment each: the near rows (ids 0-3) and the far ones (ids 4-7).
+    spark.sql(
+        "INSERT INTO "
+            + table
+            + " SELECT /*+ REPARTITION(1) */ id, array(cast(id as float) * 0.1, "
+            + "cast(id as float) * 0.1, cast(id as float) * 0.1, cast(id as float) * 0.1) "
+            + "FROM range(0, 4)");
+    spark.sql(
+        "INSERT INTO "
+            + table
+            + " SELECT /*+ REPARTITION(1) */ id, array(900.0 + cast(id as float), "
+            + "900.0 + cast(id as float), 900.0 + cast(id as float), 900.0 + cast(id as float)) "
+            + "FROM range(4, 8)");
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+
+    Dataset<Row> result =
+        spark.sql(
+            "SELECT query_id, id, _rowid, _distance FROM VECTOR_SEARCH(table => '"
+                + table
+                + "', queries => array('0.0,0.0,0.0,0.0'), k => 4, "
+                + "columns => array('id'), with_row_id => true)"
+                + " ORDER BY _distance, _rowid");
+    List<Row> rows = result.collectAsList();
+    assertEquals(4, rows.size(), "k rows for the one query");
+    for (int index = 0; index < 4; index++) {
+      assertEquals(index, rows.get(index).getInt(1), "rank " + index + " is id " + index);
+    }
+
+    // Both inserts were written as one column of fragments, and the winners are the four rows of
+    // the first one: one search unit holds the whole top k, and the merge still returns all of it.
+    int units = ((Batch) findSearchScan(result)).planInputPartitions().length;
+    assertTrue(units > 1, "the fixture must be searched by several units, got " + units);
+    Set<Long> winnerFragments = new HashSet<>();
+    for (Row row : rows) {
+      winnerFragments.add(row.getLong(2) >>> 32);
+    }
+    assertEquals(
+        1,
+        winnerFragments.size(),
+        "the whole top k must come from one fragment, got " + winnerFragments);
+    assertEquals(
+        idsOf(singleQuerySearch(table, 4, constantVector(0.0))),
+        Arrays.asList(
+            rows.get(0).getInt(1),
+            rows.get(1).getInt(1),
+            rows.get(2).getInt(1),
+            rows.get(3).getInt(1)),
+        "the batch must answer what searching the query alone answers");
+  }
+
+  /**
+   * Tied distances are broken by row id, exactly as lance-core ranks a single search, so a batch is
+   * repeatable instead of depending on which task finished first.
+   */
+  @Test
+  void tiedDistancesAreBrokenByRowId() {
+    assumeNamedArguments();
+    String table = CATALOG_NAME + ".default.ties";
+    spark.sql(
+        "CREATE TABLE "
+            + table
+            + " (id INT NOT NULL, vector ARRAY<FLOAT> NOT NULL) USING lance "
+            + "TBLPROPERTIES ('vector.arrow.fixed-size-list.size' = '4')");
+    spark.sql("INSERT INTO " + table + " SELECT id, array(0.0, 0.0, 0.0, 0.0) FROM range(0, 6)");
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+
+    String sql =
+        "SELECT query_id, id, _rowid, _distance FROM VECTOR_SEARCH(table => '"
+            + table
+            + "', queries => array('0.0,0.0,0.0,0.0', '0.0,0.0,0.0,0.0'), k => 3, "
+            + "columns => array('id'), with_row_id => true)"
+            + " ORDER BY query_id, _rowid";
+    List<Row> rows = spark.sql(sql).collectAsList();
+    assertEquals(6, rows.size(), "two queries, k rows each");
+    for (int query = 0; query < 2; query++) {
+      List<Long> rowIds = new ArrayList<>();
+      List<Float> distances = new ArrayList<>();
+      for (Row row : rows) {
+        if (row.getInt(0) == query) {
+          rowIds.add(row.getLong(2));
+          distances.add(row.getFloat(3));
+        }
+      }
+      assertEquals(3, rowIds.size(), "query " + query + " keeps k tied rows");
+      assertEquals(
+          Arrays.asList(0L, 1L, 2L),
+          rowIds,
+          "tied rows must be the three lowest row ids, in row id order: " + rowIds);
+      for (Float distance : distances) {
+        assertEquals(0.0f, distance, 1e-6f, "every row is at distance zero");
+      }
+    }
+  }
+
+  /** A misspelled merge mode is a query error, not a silent fallback to a different plan. */
+  @Test
+  void anUnknownMergeModeFailsInsteadOfPickingOne() {
+    assumeNamedArguments();
+    String table = createFiveFragmentTable();
+    spark.conf().set("spark.sql.lance.search.distributed.enabled", "true");
+    spark.conf().set("spark.sql.lance.search.batch.merge.mode", "bounded-ish");
+    try {
+      IllegalArgumentException failure =
+          assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  spark
+                      .sql(
+                          "SELECT query_id, id FROM VECTOR_SEARCH(table => '"
+                              + table
+                              + "', queries => array('0.0,0.0,0.0,0.0'), k => 1)")
+                      .collectAsList());
+      assertTrue(
+          rootMessage(failure).contains("spark.sql.lance.search.batch.merge.mode"),
+          "the error must name the option, was: " + rootMessage(failure));
+    } finally {
+      spark.conf().set("spark.sql.lance.search.batch.merge.mode", "bounded");
+    }
+  }
+
+  /** Every operator of the executed plan, depth first, so a shape assertion can name them. */
+  private static List<String> operatorNamesOf(SparkPlan plan) {
+    List<String> names = new ArrayList<>();
+    collectOperatorNames(plan, names);
+    return names;
+  }
+
+  private static void collectOperatorNames(SparkPlan plan, List<String> names) {
+    if (plan instanceof AdaptiveSparkPlanExec) {
+      collectOperatorNames(((AdaptiveSparkPlanExec) plan).executedPlan(), names);
+      return;
+    }
+    names.add(plan.getClass().getSimpleName());
+    if (plan instanceof QueryStageExec) {
+      collectOperatorNames(((QueryStageExec) plan).plan(), names);
+      return;
+    }
+    for (SparkPlan child : JavaConverters.seqAsJavaList(plan.children())) {
+      collectOperatorNames(child, names);
+    }
+  }
+
+  /** The merge node's own counters, or null when the plan holds no merge. */
+  private static Map<String, Long> mergeMetricsOf(SparkPlan plan) {
+    if (plan instanceof AdaptiveSparkPlanExec) {
+      return mergeMetricsOf(((AdaptiveSparkPlanExec) plan).executedPlan());
+    }
+    if (plan instanceof QueryStageExec) {
+      return mergeMetricsOf(((QueryStageExec) plan).plan());
+    }
+    if (plan instanceof LanceBatchTopKExec) {
+      Map<String, Long> values = new HashMap<>();
+      for (Map.Entry<String, SQLMetric> metric :
+          JavaConverters.mapAsJavaMap(plan.metrics()).entrySet()) {
+        values.put(metric.getKey(), metric.getValue().value());
+      }
+      return values;
+    }
+    for (SparkPlan child : JavaConverters.seqAsJavaList(plan.children())) {
+      Map<String, Long> found = mergeMetricsOf(child);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
   }
 
   private String constantVector(double value) {

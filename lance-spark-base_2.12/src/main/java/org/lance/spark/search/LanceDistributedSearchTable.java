@@ -35,10 +35,6 @@ public class LanceDistributedSearchTable implements SupportsRead {
   private final LanceSearchQuery query;
   private final LanceSearchVersionPin versionPin;
 
-  public LanceDistributedSearchTable(String name, StructType schema, LanceSearchQuery query) {
-    this(name, schema, query, new LanceSearchVersionPin());
-  }
-
   public LanceDistributedSearchTable(
       String name, StructType schema, LanceSearchQuery query, LanceSearchVersionPin versionPin) {
     this.name = name;

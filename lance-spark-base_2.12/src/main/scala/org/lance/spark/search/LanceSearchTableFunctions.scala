@@ -601,6 +601,12 @@ object LanceSearchTableFunctions {
    * The global top-k of every query: each task returns its own top k per query, and the merge has
    * to keep k per query rather than k overall, so the rows are ranked inside their query first.
    * Row id breaks ties the way lance-core does (by `_distance`, then row id).
+   *
+   * <p>The default is [[LanceBatchTopK]], which keeps k rows of state per query and never sorts the
+   * candidates. `spark.sql.lance.search.batch.merge.mode=spark` selects the window plan instead:
+   * `row_number()` over the query, filtered to the first k. Spark bounds that plan with
+   * `WindowGroupLimit` only below `spark.sql.optimizer.windowGroupLimitThreshold`; above it, the
+   * sort and window materialize every candidate.
    */
   private def batchRanking(rel: LogicalPlan, k: Integer): LogicalPlan = {
     val partitionSpec = Seq(columnOf(rel, QueryIndexColumn))
@@ -608,6 +614,9 @@ object LanceSearchTableFunctions {
       Seq(
         SortOrder(columnOf(rel, DistanceMetricColumn), Ascending),
         SortOrder(columnOf(rel, RowIdColumn), Ascending))
+    if (LanceBatchTopK.isBounded(SparkSession.active)) {
+      return LanceBatchTopK(rel, k.intValue(), partitionSpec, orderSpec)
+    }
     // A bare RowNumber inside Window is rejected by the analyzer; the window function has to carry
     // its OVER clause the way the parser builds it.
     val ranking =

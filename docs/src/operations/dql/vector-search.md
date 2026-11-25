@@ -181,6 +181,44 @@ fixed-size-list length, so a payload column is charged a nominal width. Measure 
 a batch is at the edge of what an executor can hold, and lower `chunk.bytes` with the observed width
 rather than the estimated one.
 
+### How a batch is ranked
+
+The merge ranks rows inside their query and keeps `num_results` per query, whatever the number of
+search units. It does not sort the candidates: each task keeps a bounded heap of `num_results` rows
+per query, so across the cluster the merge holds exactly the answer (`queries x num_results` rows),
+never the candidates (`units x queries x num_results` rows).
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `spark.sql.lance.search.batch.merge.mode` | `bounded` | `bounded` merges with `num_results` rows of state per query. `spark` restores the previous plan: `row_number()` partitioned by query, filtered to the first `num_results` rows. |
+
+The plan names the merge: `EXPLAIN` shows `LanceBatchTopK(...)`, and the node reports `numInputRows`
+(candidates it read), `numRetainedRows` (rows it kept, which is what the node returns) and
+`numDistinctQueries`. Those counters are the bound: `numRetainedRows` equals the rows returned and
+cannot exceed `queries x num_results`, while `numInputRows` is `units x queries x num_results` for a
+table with enough rows per unit.
+
+`merge.mode=spark` exists for an A/B on a cluster, not as a tuning knob: Spark bounds that plan only
+when `num_results` is below `spark.sql.optimizer.windowGroupLimitThreshold` (Spark 3.5 default
+`1000`). Above it, the sort and the window materialize every candidate, at `num_results = 2000` and
+100 queries of a 10M-row table that is millions of rows on the reduce side. Below the threshold the
+window plan is also bounded, but it adds a sort on the map side that truncates nothing, because each
+unit already returns only `num_results` rows per query.
+
+Tie-breaking is the same in both modes, and the same as one search at a time: `_distance` ascending,
+then `_rowid` ascending. Without the row id, tied distances would land on the `num_results` boundary
+in task-arrival order, and a batch would stop being repeatable.
+
+#### When it does not help
+
+- A table with one search unit, or a batch whose units all fit in one task: nothing is amplified, so
+  there is no candidate volume for the merge to drop.
+- A small `num_results` with few units: the merge was already cheap; the documented gain is in what
+  the reduce side no longer sorts and materializes, not in the number of rows a unit reads.
+- The shuffle volume is unchanged. Every unit still ships its `num_results` rows per query to the
+  merge, so a wide payload column still crosses the exchange `units` times; defer the payload
+  (`spark.sql.lance.search.payload.deferral.mode`) when that volume dominates.
+
 ## Choosing an index
 
 `VECTOR_SEARCH(..., index => 'item_vec_cosine')` searches the named index. This only works with
@@ -217,10 +255,12 @@ for row; narrower candidate sets trade recall for less re-reading.
 By default, Spark plans `VECTOR_SEARCH` with one input partition and calls the Lance namespace
 `queryTable` API. When `spark.sql.lance.search.distributed.enabled=true`, Spark instead opens the
 dataset from its executors, searches vector-index segments and uncovered fragments in parallel,
-and globally merges their candidates. The merge sorts by the distance each task reported, so each
+and globally merges their candidates. The merge ranks by the distance each task reported, so each
 task returns only its own top `num_results + offset` rows: a row outside a task's local top k
 cannot enter the global top k. `nprobes` and `refine_factor` apply per task. A batch search ranks
-inside each query before the top-k cut, so every query keeps its own `num_results` rows.
+inside each query with a bounded per-query merge before the top-k cut, so every query keeps its own
+`num_results` rows without sorting the candidates (see
+[How a batch is ranked](#how-a-batch-is-ranked)).
 
 Distributed execution treats `nprobes` as an exact probe count. A namespace server can instead
 forward it as a lower bound and let the search probe further, in which case the two paths reach

@@ -106,6 +106,9 @@ case class LanceDataSourceV2Strategy(session: SparkSession) extends SparkStrateg
     case SetUnenforcedPrimaryKey(ResolvedIdentifier(catalog, ident), columns) =>
       SetUnenforcedPrimaryKeyExec(asTableCatalog(catalog), ident, columns) :: Nil
 
+    case topK: org.lance.spark.search.LanceBatchTopK =>
+      LanceBatchTopKExec(planLater(topK.child), topK.k, topK.partitionBy, topK.orderBy) :: Nil
+
     case fetch: org.lance.spark.search.LanceFetchPayload =>
       LanceFetchPayloadExec(
         planLater(fetch.child),

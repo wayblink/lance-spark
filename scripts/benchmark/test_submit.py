@@ -1,5 +1,10 @@
 """Formal submission gates: activity is keyed by app/UID, never a pod name prefix."""
+import json
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
+
 import submit
 
 
@@ -12,6 +17,18 @@ class SubmitTests(unittest.TestCase):
         self.assertEqual(submit.activity([pod], "ours"), [])
         pod["status"]["phase"] = "Running"; pod["metadata"]["labels"]["spark-app-selector"] = "ours"
         self.assertEqual(submit.activity([pod], "ours"), [])
+
+    def test_unknown_app_blocks_and_background_is_recorded_only(self):
+        pods = [
+            {"metadata": {"name": "spark-exec-x", "uid": "u1", "labels": {"spark-role": "executor", "spark-app-selector": "mystery"}},
+             "status": {"phase": "Running"}, "spec": {"nodeName": "n1"}},
+            {"metadata": {"name": "kyuubi-engine-x", "uid": "u2", "labels": {"spark-role": "driver", "spark-app-selector": "svc"}},
+             "status": {"phase": "Running"}, "spec": {"nodeName": "n2"}},
+        ]
+        details = submit.activity_details(pods)
+        self.assertEqual({x["category"] for x in details}, {"unknown", "background"})
+        self.assertEqual([x["uid"] for x in submit.activity(pods)], ["u1"])
+        self.assertEqual(submit.schedule()["spark.kubernetes.driver.node.selector.kubernetes.io/hostname"], "cpu-1122.host.platform.basemind.com")
 
     def test_unknown_api_or_dynamic_overlap_invalidates_whole_cell(self):
         sample = {"warmup": False, "started_ms": 1000, "ms": 500}
@@ -30,8 +47,6 @@ class SubmitTests(unittest.TestCase):
         with self.assertRaises(ValueError): submit.validate_expected_cell(rows,"single",10,True)
 
     def test_evidence_timeout_does_not_prevent_failure_verdict(self):
-        import json,subprocess,tempfile
-        from pathlib import Path
         with tempfile.TemporaryDirectory() as root:
             p=Path(root);errors={}
             def timeout():raise subprocess.TimeoutExpired("kubectl",1)
@@ -43,7 +58,7 @@ class SubmitTests(unittest.TestCase):
             self.assertEqual(v["evidence_errors"]["logs"],"TimeoutExpired")
 
     def test_schedule_is_frozen_and_no_existing_pod_delete_command(self):
-        self.assertEqual(submit.schedule(), {"spark.kubernetes.driver.node.selector.kubernetes.io/hostname": "cpu-1122.host.platform.shaipower.com"})
+        self.assertEqual(submit.schedule(), {"spark.kubernetes.driver.node.selector.kubernetes.io/hostname": "cpu-1122.host.platform.basemind.com"})
         options = submit.delete_options("u1")
         self.assertEqual(options["preconditions"]["uid"], "u1")
         self.assertNotIn("labelSelector", options)

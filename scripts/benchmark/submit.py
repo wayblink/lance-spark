@@ -14,32 +14,84 @@ import pilot
 
 POLL_SECONDS = 20
 
+# Names/arguments used by long-lived Spark services must not block a benchmark window.
+BACKGROUND_TOKENS = (
+    "kyuubi", "thrift", "thriftserver", "connect", "spark-connect-server",
+    "long-lived", "long_lived",
+)
+# These are evidence tokens, not pod-name prefixes: driver evidence classifies its app's executors too.
+BENCHMARK_TOKENS = (
+    "tpcds", "tpc", "fmt", "format", "bench", "topk", "oss", "pure", "lance-iceberg",
+)
 
-def schedule():
-    # Freeze this setting for the whole matrix; executors retain normal scheduler placement.
-    return {"spark.kubernetes.driver.node.selector.kubernetes.io/hostname": "cpu-1122.host.platform.shaipower.com"}
+
+def _pod_text(pod):
+    """Return bounded identifying text from labels, names and container args."""
+    meta = pod.get("metadata", {})
+    labels = meta.get("labels", {})
+    annotations = meta.get("annotations", {})
+    spec = pod.get("spec", {})
+    parts = [meta.get("name", ""), *[str(v) for v in labels.values()], *[str(v) for v in annotations.values()]]
+    for container in spec.get("containers", []) or []:
+        parts.extend(str(v) for v in (container.get("name"), container.get("command", []), container.get("args", [])))
+        for env in container.get("env", []) or []:
+            parts.append(str(env.get("name", "")))
+    return " ".join(parts).lower()[:12000]
 
 
-def delete_options(uid):
-    return {"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": {"uid": uid}}
-
-
-def activity(pods, own_app=None, own_name=None):
-    out = []
-    for p in pods:
-        meta, status = p.get("metadata", {}), p.get("status", {})
-        labels = meta.get("labels", {})
+def activity_details(pods, own_app=None, own_name=None):
+    """Classify live Spark pods as benchmark, background, or unknown by app evidence."""
+    live = []
+    app_evidence = {}
+    for pod in pods:
+        meta, status = pod.get("metadata", {}), pod.get("status", {})
         if status.get("phase") in ("Succeeded", "Failed", "Error"):
             continue
+        labels = meta.get("labels", {})
         role = labels.get("spark-role")
         app = labels.get("spark-app-selector")
         if role not in ("driver", "executor") and not app:
             continue
+        text = _pod_text(pod)
+        key = app or f"pod:{meta.get('uid') or meta.get('name')}"
+        app_evidence.setdefault(key, []).append(text)
+        live.append((pod, role, app, key))
+
+    app_category = {}
+    for key, texts in app_evidence.items():
+        joined = " ".join(texts)
+        if any(token in joined for token in BACKGROUND_TOKENS):
+            app_category[key] = "background"
+        elif any(token in joined for token in BENCHMARK_TOKENS):
+            app_category[key] = "benchmark"
+        else:
+            app_category[key] = "unknown"
+
+    out = []
+    for pod, role, app, key in live:
+        meta, status = pod.get("metadata", {}), pod.get("status", {})
         if (own_app and app == own_app) or meta.get("name") == own_name:
             continue
-        out.append({"uid":meta.get("uid"), "name":meta.get("name"), "app":app,
-                    "role":role, "phase":status.get("phase"), "node":p.get("spec", {}).get("nodeName")})
+        out.append({"uid": meta.get("uid"), "name": meta.get("name"), "app": app,
+                    "role": role, "phase": status.get("phase"),
+                    "node": pod.get("spec", {}).get("nodeName"),
+                    "category": app_category[key]})
     return out
+
+
+def activity(pods, own_app=None, own_name=None):
+    """Return active benchmark/unknown pods; background services only affect evidence."""
+    return [item for item in activity_details(pods, own_app, own_name)
+            if item["category"] in ("benchmark", "unknown")]
+
+
+def schedule():
+    # Freeze this setting for the whole matrix; executors retain normal scheduler placement.
+    return {"spark.kubernetes.driver.node.selector.kubernetes.io/hostname": "cpu-1122.host.platform.basemind.com"}
+
+
+def delete_options(uid):
+    return {"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": {"uid": uid}}
 
 
 def window_valid(samples, observations):
@@ -68,8 +120,12 @@ def snapshot(ns, own_app=None, own_name=None):
         items = json.loads(p.stdout).get("items", []) if ok else []
     except (subprocess.TimeoutExpired, ValueError):
         ok, items = False, []
+    details = activity_details(items, own_app, own_name)
     return {"at_ms":int(time.time()*1000), "api_ok":ok,
-            "foreign":activity(items, own_app, own_name),
+            "foreign":[x for x in details if x["category"] in ("benchmark", "unknown")],
+            "background":[x for x in details if x["category"] == "background"],
+            "classification": {category: sum(x["category"] == category for x in details)
+                               for category in ("benchmark", "background", "unknown")},
             "owned":[{"uid":x["metadata"]["uid"], "name":x["metadata"]["name"],
                        "app":x["metadata"].get("labels", {}).get("spark-app-selector"),
                        "phase":x.get("status", {}).get("phase"), "node":x.get("spec", {}).get("nodeName"),

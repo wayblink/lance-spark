@@ -356,6 +356,18 @@ public class LanceDistributedSearchScan implements Scan, Batch, Serializable {
     for (Fragment fragment : dataset.getFragments()) {
       existingFragments.add(fragment.getId());
     }
+    if (existingFragments.isEmpty()) {
+      // An empty dataset plans no units. Return before discovery, so an empty table cannot start
+      // depending on whether its (absent) index can be listed.
+      return new PlanSnapshot(
+          existingFragments,
+          Collections.emptyList(),
+          Collections.emptySet(),
+          resolveVectorColumn(),
+          null,
+          null,
+          false);
+    }
 
     boolean fastSearch = Boolean.TRUE.equals(query.getFastSearch());
     boolean bypassVectorIndex = Boolean.TRUE.equals(query.getBypassVectorIndex());

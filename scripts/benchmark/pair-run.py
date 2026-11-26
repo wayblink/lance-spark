@@ -318,8 +318,16 @@ def execute(plan):
                 for name in arms:
                     current = {"round": round_number, "cell": cell_name(kind, k), "arm": name,
                                "directory": str(cell_directory(root, name, round_number, kind, k))}
-                    records, verdict = submit.run_one_cell(contexts[name], kind, k,
-                                                           plan["window_seconds"])
+                    # ``run_one_cell`` refuses an unusable cell by raising. In a paired run that
+                    # must not throw away the rounds that already succeeded, so the failure is
+                    # recorded and the plan continues; the cell simply has no comparable sample.
+                    try:
+                        records, verdict = submit.run_one_cell(contexts[name], kind, k,
+                                                               plan["window_seconds"])
+                    except Exception as exc:
+                        completed.append({**current, "samples": 0, "window_usable": False,
+                                          "unusable": "%s: %s" % (type(exc).__name__, exc)})
+                        continue
                     completed.append({**current, "samples": len(records),
                                       "window_usable": verdict.get("window_usable"),
                                       "exclusive_window_valid": verdict.get("exclusive_window_valid"),

@@ -258,3 +258,52 @@ class PairAggregationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnusableCellTests(unittest.TestCase):
+    """One unusable cell must not discard the rounds that already produced data."""
+
+    def test_an_unusable_cell_is_recorded_and_the_run_continues(self):
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        contracts = {}
+        for name in ("c1", "c2"):
+            path = Path(tmpdir) / name
+            path.write_text("{}")
+            contracts[name] = str(path)
+        plan = {"output_root": str(Path(tmpdir) / "out"), "repeats": 1, "window_seconds": 1,
+                "stopped_evidence": None, "queries": "q", "truth": "t",
+                "arms": [{"name": "a", "contract": contracts["c1"]},
+                         {"name": "b", "contract": contracts["c2"]}],
+                "cells": [{"kind": "single", "k": 10}, {"kind": "single", "k": 100}]}
+        seen = []
+
+        def fake_prepare(*args, **kwargs):
+            Path(args[4]).mkdir(parents=True, exist_ok=True)
+            return {}
+
+        def fake_run(context, kind, k, window_seconds):
+            seen.append((kind, k))
+            if (kind, k) == ("single", 10):
+                raise ValueError("cell single k10 not usable")
+            class Verdict(dict):
+                def get(self, key, default=None):
+                    return {"window_usable": True, "exclusive_window_valid": True,
+                            "contamination": None}.get(key, default)
+            return [{"kind": kind, "k": k}], Verdict()
+
+        originals = (pair_run.submit.prepare_matrix, pair_run.submit.run_one_cell,
+                     pair_run.collect_rounds, pair_run.render_pair, pair_run.verdict_document)
+        try:
+            pair_run.submit.prepare_matrix = fake_prepare
+            pair_run.submit.run_one_cell = fake_run
+            pair_run.collect_rounds = lambda *a, **k: {}
+            pair_run.render_pair = lambda *a, **k: []
+            pair_run.verdict_document = lambda *a, **k: {}
+            result = pair_run.execute(plan)
+        finally:
+            (pair_run.submit.prepare_matrix, pair_run.submit.run_one_cell,
+             pair_run.collect_rounds, pair_run.render_pair, pair_run.verdict_document) = originals
+
+        self.assertEqual(result["cells_run"], 4)
+        self.assertIn(("single", 100), seen)
